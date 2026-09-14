@@ -47,7 +47,10 @@ Copy-Item '.\Kling-H3路线B-Electron交付包-20260904\module\.env.example' '.\
 
 ## 运行与检查
 
+请在**仓库根目录**运行以下命令，也就是同时包含 `package.json`、`electron/` 和两个服务目录的 `video-agent` 文件夹：
+
 ```powershell
+cd "你的仓库路径\video-agent"
 npm start
 ```
 
