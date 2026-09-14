@@ -1,0 +1,11 @@
+{
+  "name": "kling-image-o1-minimax-h3-route-b",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs && node --check public/app.js",
+    "smoke": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .scripts/smoke-test.ps1"
+  }
+}

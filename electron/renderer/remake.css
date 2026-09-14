@@ -1,0 +1,196 @@
+.result-video.remake-preview {
+  width: min(620px, calc(100% - 40px));
+  margin: 20px auto 14px;
+  padding: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #e4e5e9;
+  border-radius: 16px;
+  background: #f7f8fa;
+}
+
+.result-video.remake-preview img {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  max-height: calc(100vh - 330px);
+  border-radius: 10px;
+  object-fit: contain;
+  background: #17191e;
+  box-shadow: 0 10px 28px rgba(25, 26, 31, 0.12);
+}
+
+.confirm-actions {
+  width: min(720px, calc(100% - 40px));
+  margin: 0 auto 24px;
+  padding: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: 10px;
+  border: 1px solid #e4e5e9;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 10px 24px rgba(28, 31, 38, 0.06);
+}
+
+.confirm-actions button {
+  min-width: 0;
+  height: 40px;
+  padding: 8px 12px;
+  border-radius: 9px;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.confirm-actions .icon-button {
+  color: #6046a1;
+  background: #f8f6fd;
+  font-weight: 750;
+}
+
+.confirm-actions .icon-button:hover {
+  border-color: #cfc2ee;
+  background: #f2edfc;
+}
+
+.keyframe-review-grid {
+  width: min(820px, calc(100% - 40px));
+  margin: 20px auto 14px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.keyframe-review-grid article {
+  min-width: 0;
+  padding: 10px;
+  display: grid;
+  gap: 9px;
+  border: 1px solid #e4e5e9;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 10px 24px rgba(28, 31, 38, 0.06);
+  transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+}
+
+.keyframe-review-grid article.is-selected {
+  border-color: #8b6de0;
+  box-shadow: 0 0 0 2px #eee8ff, 0 12px 28px rgba(91, 58, 164, 0.12);
+  transform: translateY(-2px);
+}
+
+.keyframe-review-grid img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 9 / 16;
+  border-radius: 9px;
+  object-fit: contain;
+  background: #17191e;
+}
+
+.keyframe-review-grid article > span {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.keyframe-review-grid article > span small {
+  color: #858892;
+  white-space: nowrap;
+}
+
+.keyframe-review-grid button {
+  width: 100%;
+  height: 38px;
+  border-radius: 8px;
+}
+
+.keyframe-review-grid .keyframe-select {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid #dddfe4;
+  color: #686b73;
+  background: #fff;
+  cursor: pointer;
+}
+
+.keyframe-review-grid .keyframe-select i {
+  width: 16px;
+  height: 16px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #c9cbd1;
+  border-radius: 5px;
+  font-size: 10px;
+  font-style: normal;
+}
+
+.keyframe-review-grid article.is-selected .keyframe-select {
+  border-color: #cfc2ee;
+  color: #6046a1;
+  background: #f6f2ff;
+  font-weight: 750;
+}
+
+.keyframe-review-grid article.is-selected .keyframe-select i {
+  border-color: var(--purple);
+  color: #fff;
+  background: var(--purple);
+}
+
+.confirm-actions .icon-button:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.confirm-actions--single {
+  width: min(820px, calc(100% - 40px));
+  grid-template-columns: 1fr;
+}
+
+.result-video.remake-final-video {
+  height: calc(100% - 112px);
+  min-height: 420px;
+  padding: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.result-video.remake-final-video video {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  max-height: min(760px, calc(100vh - 210px));
+  margin: 0;
+  border-radius: 16px;
+  background: #15171c;
+  box-shadow: 0 14px 36px rgba(25, 26, 31, 0.15);
+}
+
+@media (max-width: 1100px) {
+  .confirm-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .result-video.remake-preview img {
+    max-height: calc(100vh - 380px);
+  }
+
+  .result-video.remake-final-video {
+    min-height: 360px;
+  }
+}
+
+@media (max-width: 760px) {
+  .keyframe-review-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

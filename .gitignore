@@ -1,0 +1,54 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Secrets and local configuration
+.env
+**/.env
+.env.*
+**/.env.*
+!.env.example
+!**/.env.example
+*.pem
+*.key
+
+# Runtime data and temporary state
+client-data/
+client-data-*/
+**/runs/
+**/runs-v1/
+**/.runtime/
+*.log
+*.pid
+*.tmp
+
+# Build output
+dist/
+out/
+release/
+
+# Bundled executables are too large for normal GitHub source storage
+packaging-resources/tools/**/*.exe
+
+# Old prototypes and unrelated local projects
+batch-results-current/
+facefusion-local/
+frontend-preview/
+kling-3-omni-demo/
+seedance-product-swap-demo/
+video-mix-standalone/
+electron/renderer/ui-concepts.html
+
+# Stale standalone delivery wrapper; the active product service is in module/
+Kling-H3路线B-Electron交付包-20260904/DELIVERY-MANIFEST.md
+Kling-H3路线B-Electron交付包-20260904/README.md
+Kling-H3路线B-Electron交付包-20260904/SHA256SUMS.txt
+Kling-H3路线B-Electron交付包-20260904/docs/
+Kling-H3路线B-Electron交付包-20260904/fixtures/
+Kling-H3路线B-Electron交付包-20260904/tests/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

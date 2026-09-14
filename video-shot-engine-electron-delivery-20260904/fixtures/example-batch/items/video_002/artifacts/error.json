@@ -1,0 +1,10 @@
+{
+  "name": "Error",
+  "message": "Request contains an invalid argument.",
+  "status": 400,
+  "videoId": "video_002",
+  "sourceFilename": "示例失败.mp4",
+  "failedStage": "provider_processing",
+  "occurredAt": "2026-09-04T00:00:10.000Z"
+}
+

@@ -1,0 +1,20 @@
+{
+  "batchId": "batch_example",
+  "status": "partial",
+  "createdAt": "2026-09-04T00:00:00.000Z",
+  "threshold": 20,
+  "minDurationSec": 0.2,
+  "processingMode": "serial",
+  "items": [
+    { "videoId": "video_001", "status": "completed", "sourceFilename": "示例成功.mp4" },
+    { "videoId": "video_002", "status": "failed", "sourceFilename": "示例失败.mp4" }
+  ],
+  "usage": {
+    "total_tokens": 1200,
+    "total_input_tokens": 1000,
+    "total_output_tokens": 200,
+    "total_thought_tokens": 0,
+    "estimated_cost_yuan": 0.003
+  }
+}
+

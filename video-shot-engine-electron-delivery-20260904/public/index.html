@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>镜头切分与素材命名</title>
+  <style>
+    :root{color-scheme:light;--ink:#19232c;--muted:#687680;--line:#d9e0e2;--soft:#f7f8f6;--green:#25805c;--red:#bd413c;--blue:#d65236}
+    *{box-sizing:border-box}body{margin:0;font-family:Inter,"Microsoft YaHei",system-ui,sans-serif;color:var(--ink);background:#f7f8f6;letter-spacing:0}
+    header{position:relative;border-bottom:4px solid #d65236;padding:24px clamp(18px,4vw,48px);background:#1d2a31;color:#dce5e5}header h1{font-size:24px;margin:0 0 6px}header p{margin:0;color:#9db0af;font-size:14px}.home-button{position:absolute;right:clamp(18px,4vw,48px);top:24px;border:1px solid #78908f;border-radius:0;padding:8px 12px;color:#dce5e5;background:transparent;cursor:pointer;font-size:12px}
+    main{max-width:1160px;margin:0 auto;padding:28px 24px 56px}section{padding:0 0 28px;margin:0 0 28px;border-bottom:1px solid var(--line)}
+    h2{font-size:17px;margin:0 0 18px}.config{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--muted)}.config strong{color:var(--ink)}
+    form{display:grid;grid-template-columns:minmax(280px,1fr) repeat(3,minmax(150px,210px));gap:16px 20px;align-items:end}
+    label{display:grid;gap:7px;font-size:13px;font-weight:600}input[type=file],input[type=number],select{width:100%;height:40px;border:1px solid #aeb4bd;border-radius:5px;padding:8px;background:#fff;font:inherit}
+    .toggles{grid-column:1/-1;display:flex;gap:26px;flex-wrap:wrap}.toggles label{display:flex;align-items:center;gap:8px;font-weight:500}.toggles input{width:16px;height:16px}
+    button{min-height:40px;padding:8px 16px;border:1px solid #aeb8ba;border-radius:0;background:#fff;color:#202124;font:600 14px inherit;cursor:pointer}button.primary{background:#d65236;border-color:#a83b26;color:#fff}button:disabled{opacity:.45;cursor:not-allowed}
+    .actions{grid-column:1/-1;display:flex;gap:10px;flex-wrap:wrap}.statusline{display:flex;align-items:center;gap:10px;min-height:28px;margin:4px 0 18px;font-size:14px}.dot{width:8px;height:8px;border-radius:50%;background:#98a2b3;flex:none}.dot.active{background:var(--blue)}.dot.ok{background:var(--green)}.dot.error{background:var(--red)}
+    .summary{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);margin-bottom:22px}.metric{background:#fff;padding:14px}.metric span{display:block;color:var(--muted);font-size:12px;margin-bottom:5px}.metric strong{font-size:18px}
+    .shot-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.shot{border:1px solid var(--line);border-radius:6px;padding:15px;min-width:0}.shot-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.shot h3{font-size:15px;margin:0;overflow-wrap:anywhere}.time{font-size:12px;color:var(--muted);white-space:nowrap}.tags{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}.tag{border:1px solid #c8d0da;border-radius:4px;padding:3px 6px;font-size:12px;background:var(--soft)}.review{color:#8a4b00;border-color:#e6b566;background:#fff8e8}.evidence{font-size:13px;color:#475467;line-height:1.55;margin:8px 0}.links{display:flex;gap:14px;margin-top:10px;font-size:13px}.links a{color:#0759b5;text-decoration:none}.links a:hover{text-decoration:underline}.errorbox{color:var(--red);background:#fff4f2;border-left:3px solid var(--red);padding:10px 12px;font-size:13px;white-space:pre-wrap}
+    .empty{color:var(--muted);font-size:14px;padding:22px 0}code{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+    @media(max-width:760px){main{padding:22px 16px 44px}form{grid-template-columns:1fr}.toggles,.actions{grid-column:1}.summary{grid-template-columns:repeat(2,1fr)}.shot-list{grid-template-columns:1fr}.shot-head{display:block}.time{display:block;margin-top:5px}}
+  </style>
+</head>
+<body>
+  <header><button class="home-button" type="button" onclick="window.videoClient?.goHome()">← 返回工作台</button><h1>镜头切分与素材命名</h1><p>FFmpeg 帧级镜头检测 · xinhankr Gemini 边界复核与命名</p></header>
+  <main>
+    <section>
+      <h2>服务状态</h2>
+      <div id="config" class="config">正在读取配置...</div>
+    </section>
+    <section>
+      <h2>新建运行</h2>
+      <form id="form">
+        <label>视频文件（可多选）<input type="file" name="videos" accept="video/*" multiple required></label>
+        <label>运行类别<select name="workflow"><option value="ffmpeg_only">仅 FFmpeg 切割</option><option value="ffmpeg_gemini_naming">FFmpeg + Gemini 命名</option></select></label>
+        <label>显著变化阈值<input name="threshold" type="number" value="20" step="0.1"></label>
+        <label>最短镜头（秒）<input name="minDurationSec" type="number" value="0.2" min="0.1" step="0.05"></label>
+        <div class="toggles">
+          <label><input name="keepAudio" type="checkbox" checked>切片保留原声</label>
+        </div>
+        <div class="actions"><button class="primary" type="submit">开始切分</button><button id="nameButton" type="button" disabled>开始识别命名</button><button id="resumeButton" type="button" disabled>恢复命名</button></div>
+      </form>
+    </section>
+    <section id="resultsSection">
+      <h2>运行结果</h2>
+      <div id="status" class="statusline"><span class="dot"></span><span>等待上传视频</span></div>
+      <div id="summary"></div>
+      <div id="error"></div>
+      <div id="result" class="empty">暂无镜头</div>
+    </section>
+  </main>
+  <script>
+    const form=document.querySelector('#form'),statusEl=document.querySelector('#status'),summaryEl=document.querySelector('#summary'),resultEl=document.querySelector('#result'),errorEl=document.querySelector('#error');
+    const nameButton=document.querySelector('#nameButton'),resumeButton=document.querySelector('#resumeButton'),configEl=document.querySelector('#config');
+    let config=null,currentRunId=null,currentData=null,pollTimer=null;
+    const stageNames={queued:'等待处理',ffmpeg_processing:'FFmpeg 正在检测镜头',ffmpeg_completed:'FFmpeg 镜头检测完成',shots_completed:'镜头切分完成',naming_prepare:'准备命名任务',naming_processing:'准备命名',analysis_video_processing:'正在生成编号分析视频',analysis_video_completed:'编号分析视频完成',provider_processing:'xinhankr 正在复核并命名',provider_retry:'临时网络错误，正在重试',provider_completed:'xinhankr 结果已保存',gemini_analysis_retry:'配额恢复后重试',quota_wait:'等待配额恢复',naming_export:'正在生成命名文件',completed:'识别命名完成',naming_failed:'识别命名失败'};
+    const esc=value=>String(value??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+    const mediaUrl=(runId,filePath)=>`/runs/${encodeURIComponent(runId)}/${String(filePath).split('/').map(encodeURIComponent).join('/')}`;
+    function setStatus(text,state='active'){statusEl.innerHTML=`<span class="dot ${state}"></span><span>${esc(text)}</span>`}
+    async function loadConfig(){const response=await fetch('/api/config');config=await response.json();configEl.innerHTML=`<span>模型 <strong>${esc(config.model)}</strong></span><span>媒体分辨率 <strong>${esc(config.mediaResolution)}</strong></span><span>API Key <strong>${config.apiKeyConfigured?'已配置':'未配置'}</strong></span><span>代理 <strong>${config.proxyConfigured?'已配置':'未配置'}</strong></span>`;if(!config.apiKeyConfigured)form.elements.workflow.value='ffmpeg_only'}
+    const toolSource=value=>value==='client_directory'?'客户端目录':value==='system_path'?'系统 PATH':'配置路径';
+    function renderSummary(run,manifest){const elapsed=Number(run.ffmpegDurationMs||0)+Number(run.namingDurationMs||0),ffmpeg=run.mediaTools?.ffmpeg;summaryEl.innerHTML=`<div class="summary"><div class="metric"><span>镜头数</span><strong>${manifest?.length||run.shots?.length||0}</strong></div><div class="metric"><span>已命名</span><strong>${manifest?.length||0}</strong></div><div class="metric"><span>实际运行耗时</span><strong>${elapsed?formatDuration(elapsed):'未记录'}</strong></div><div class="metric"><span>FFmpeg 来源</span><strong>${ffmpeg?toolSource(ffmpeg.source):'未记录'}</strong></div></div>${ffmpeg?`<div class="evidence">FFmpeg：<code>${esc(ffmpeg.resolvedPath)}</code><br>${esc(ffmpeg.versionLine)}</div>`:''}`}
+    function renderShots(run,manifest){const count=manifest?.length||0;resultEl.className='empty';resultEl.textContent=count?`成功拆分并命名 ${count} 段`:run.status==='completed'?`拆分完成，共 ${run.shots?.length||0} 段`:'处理完成后显示拆分段数'}
+    function render(data){currentData=data;if(data.batch){renderBatch(data);return}resumeButton.textContent='恢复命名';const run=data.run;renderSummary(run,data.renameManifest);renderShots(run,data.renameManifest);const failed=run.status==='failed';const done=run.status==='completed';setStatus(stageNames[run.stage]||run.stage||'处理中',failed?'error':done?'ok':'active');errorEl.innerHTML=data.namingError?`<div class="errorbox">${esc(data.namingError.message||run.namingError||'识别命名失败')}</div>`:'';nameButton.disabled=!config?.apiKeyConfigured||run.namingActive||run.status!=='shots_completed';resumeButton.disabled=!config?.apiKeyConfigured||run.namingActive||!failed;if(done||failed)stopPolling()}
+    function renderBatch(data){
+      const batch=data.batch,items=data.items||[],counts=items.reduce((a,x)=>(a[x.status]=(a[x.status]||0)+1,a),{});
+      const usage=items.reduce((sum,item)=>({total_tokens:sum.total_tokens+Number(item.usage?.total_tokens||0),total_input_tokens:sum.total_input_tokens+Number(item.usage?.total_input_tokens||0),total_output_tokens:sum.total_output_tokens+Number(item.usage?.total_output_tokens||0)}),{total_tokens:0,total_input_tokens:0,total_output_tokens:0});
+      const activeMs=items.reduce((sum,item)=>sum+Number(item.activeDurationMs||0),0);
+      summaryEl.innerHTML=`<div class="summary"><div class="metric"><span>批次视频</span><strong>${items.length}</strong></div><div class="metric"><span>完成 / 失败</span><strong>${counts.completed||0} / ${counts.failed||0}</strong></div><div class="metric"><span>累计实际处理</span><strong>${activeMs?formatDuration(activeMs):'处理中'}</strong></div><div class="metric"><span>总 Token</span><strong>${usage.total_tokens||'未返回'}</strong></div><div class="metric"><span>预估总费用</span><strong>${formatCost(usage)}</strong></div></div><div class="evidence">费用按输入 ¥1.5/百万、输出 ¥7.5/百万估算，仅统计返回 usage 的请求。批次墙钟 ${batch.wallDurationMs?formatDuration(batch.wallDurationMs):'处理中'} · 配额等待 ${formatDuration(batch.quotaWaitDurationMs||0)} · <a href="/runs/${encodeURIComponent(batch.batchId)}/catalog.csv" target="_blank">下载目录 CSV</a></div>`;
+      resultEl.className='shot-list';
+      resultEl.innerHTML=items.map(item=>{const wait=item.status==='quota_wait'?`<div class="evidence">配额等待 ${formatDuration(item.quotaWaitDurationMs||0)}，预计 ${esc(new Date(item.quotaRetryAt).toLocaleTimeString())} 重试</div>`:'';const unknownCost=item.unknownCostAttempts?`<div class="evidence">${item.unknownCostAttempts} 次超时/断线请求费用未知，请以供应商账单为准</div>`:'';const error=item.error&&item.status!=='quota_wait'?`<div class="errorbox">阶段：${esc(item.failedStage||'未知')}\n${esc(item.error)}</div>`:'';const retry=item.status==='failed'?`<button type="button" data-retry-video="${esc(item.videoId)}">重试此视频</button>`:'';const segments=item.status==='completed'?`<span class="tag">拆分 ${item.namedShotCount??item.shots?.length??0} 段</span>`:'';const provider=item.providerSuccessMode?`<span class="tag">${esc(item.providerSuccessMode)} 第${item.providerSuccessRepeat||1}次成功</span>`:'';return `<article class="shot"><div class="shot-head"><h3>${esc(item.sourceFilename||item.videoId)}</h3><span class="time">${esc(stageNames[item.stage]||item.stage||item.status)}</span></div><div class="tags"><span class="tag">${esc(item.status)}</span>${segments}${provider}<span class="tag">实际 ${item.activeDurationMs?formatDuration(item.activeDurationMs):'处理中'}</span><span class="tag">Token ${item.usage?.total_tokens??'未返回'}</span><span class="tag">费用 ${formatCost(item.usage)}</span><span class="tag">API尝试 ${item.providerAttempts?.length??item.providerAttemptCount??0}</span></div>${wait}${unknownCost}${error}${retry}</article>`}).join('');
+      resultEl.querySelectorAll('[data-retry-video]').forEach(button=>button.onclick=()=>retryBatchItem(button.dataset.retryVideo));
+      const done=['completed','partial','failed'].includes(batch.status),interrupted=batch.status==='processing'&&!batch.active;nameButton.disabled=true;resumeButton.textContent='恢复批次';resumeButton.disabled=batch.active||(!['partial','failed'].includes(batch.status)&&!interrupted);setStatus(interrupted?'批次处理中断，可恢复':`批次${batch.status==='completed'?'完成':batch.status==='partial'?'部分完成':batch.status==='failed'?'失败':'处理中'}`,interrupted?'error':done?'ok':'active');if(done||interrupted)stopPolling();
+    }
+    const formatDuration=ms=>{const sec=Math.round(Number(ms||0)/1000);return `${Math.floor(sec/60)}分${String(sec%60).padStart(2,'0')}秒`};
+    const costYuan=usage=>(Number(usage?.total_input_tokens||0)*1.5+Number(usage?.total_output_tokens||0)*7.5)/1000000;
+    const formatCost=usage=>usage?.total_tokens?`¥${costYuan(usage).toFixed(4)}`:'未返回';
+    async function fetchRun(){if(!currentRunId)return;const response=await fetch(currentRunId.startsWith('batch_')?`/api/batches/${encodeURIComponent(currentRunId)}`:`/api/runs/${encodeURIComponent(currentRunId)}`);const data=await response.json();if(response.ok)render(data)}
+    function startPolling(){stopPolling();pollTimer=setInterval(fetchRun,2000);fetchRun()}
+    function stopPolling(){if(pollTimer){clearInterval(pollTimer);pollTimer=null}}
+    async function startNaming(endpoint='name'){if(!currentRunId)return;nameButton.disabled=resumeButton.disabled=true;const url=currentRunId.startsWith('batch_')?`/api/batches/${encodeURIComponent(currentRunId)}/resume`:`/api/runs/${encodeURIComponent(currentRunId)}/${endpoint}`;const response=await fetch(url,{method:'POST'});const data=await response.json();if(!response.ok){setStatus(data.error||'无法启动任务','error');return}startPolling()}
+    async function retryBatchItem(videoId){if(!currentRunId||!videoId)return;const response=await fetch(`/api/batches/${encodeURIComponent(currentRunId)}/items/${encodeURIComponent(videoId)}/retry`,{method:'POST'});const data=await response.json();if(!response.ok){setStatus(data.error||'无法重试该视频','error');return}startPolling()}
+    nameButton.onclick=()=>startNaming('name');resumeButton.onclick=()=>startNaming('resume-naming');
+    form.onsubmit=async event=>{event.preventDefault();stopPolling();errorEl.innerHTML='';summaryEl.innerHTML='';resultEl.className='empty';resultEl.textContent='正在处理...';setStatus('正在创建任务');form.querySelector('button[type=submit]').disabled=true;try{const files=form.elements.videos.files;const body=new FormData();for(const file of files)body.append('videos',file);for(const name of ['workflow','threshold','minDurationSec','keepAudio']){const control=form.elements[name];if(control.type==='checkbox'){if(control.checked)body.append(name,'on')}else body.append(name,control.value)}const endpoint=files.length>1?'/api/batches':'/api/runs';if(files.length===1){body.delete('videos');body.append('video',files[0])}const response=await fetch(endpoint,{method:'POST',body});const data=await response.json();if(!response.ok)throw Error(data.error);currentRunId=files.length>1?data.batchId:data.runId;localStorage.setItem('shotNamingCurrentRunId',currentRunId);await fetchRun();startPolling()}catch(error){setStatus(`失败：${error.message}`,'error');resultEl.textContent='运行失败'}finally{form.querySelector('button[type=submit]').disabled=false}};
+    loadConfig().then(async()=>{let saved=localStorage.getItem('shotNamingCurrentRunId');if(!saved){const response=await fetch('/api/runs/latest');if(response.ok)saved=(await response.json()).runId}if(saved){currentRunId=saved;localStorage.setItem('shotNamingCurrentRunId',saved);await fetchRun();if(currentData?.run?.status==='processing'||currentData?.batch?.status==='processing')startPolling()}}).catch(error=>{configEl.textContent=`配置读取失败：${error.message}`});
+  </script>
+</body>
+</html>

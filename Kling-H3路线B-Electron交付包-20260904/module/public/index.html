@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kling O1 → MiniMax H3-open 路线 B</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <button class="home-button" type="button" onclick="window.videoClient?.goHome()">← 返回工作台</button>
+    <div><p class="eyebrow">ROUTE B / IMAGE TO VIDEO</p><h1>Kling O1 → MiniMax H3-open</h1></div>
+    <div id="connection" class="connection" data-state="loading"><span></span><strong>检查配置</strong></div>
+  </header>
+  <main>
+    <section>
+      <div class="section-heading"><div><p class="step">01 / 素材</p><h2>原视频与商品图</h2></div><p class="hint">自动提取原视频首帧</p></div>
+      <div class="input-grid">
+        <label class="upload-zone" id="videoZone"><input id="videoInput" type="file" accept="video/mp4,video/quicktime,.mp4,.mov"><span>Source video</span><strong>选择原视频</strong><small id="videoMeta">MP4 / MOV</small></label>
+        <label class="upload-zone" id="productZone"><input id="productInput" type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"><span>Product image</span><strong>选择商品参考图</strong><small id="productMeta">一张主体清晰的商品参考图</small></label>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-heading"><div><p class="step">02 / 图片替换</p><h2>Kling Image O1</h2></div><code>POST /v1/images/omni-image</code></div>
+      <label class="field"><span>图片替换 Prompt</span><textarea id="imagePrompt" rows="10" maxlength="2500">Image 1 is the source scene. Image 2 is the reference for the replacement product.
+
+Replace only the intended product or object in image 1 with the primary product shown in image 2. Use image 2 only for the product itself; ignore its background, surface, props, people, decorative elements, surrounding text, and lighting setup.
+
+Preserve the replacement product's identity and intrinsic design exactly as shown in image 2: overall silhouette, proportions, construction, component placement, colors, materials, surface finish, distinctive details, and, where present, branding, graphics, symbols, and packaging artwork. Treat visible artwork as a coherent visual texture. Do not redesign, simplify, hybridize, stretch, crop, rewrite, or invent product features. Do not retain any appearance or structural details from the original object being replaced.
+
+Adapt only the product's overall scale, position, orientation, perspective, illumination, reflections, and cast shadow so it fits naturally into image 1. Keep the product structurally rigid and dimensionally consistent; never deform its intrinsic shape to match the original object or surrounding geometry.
+
+Respect the physical context already visible in image 1. If the product is held, worn, touched, supported, inserted, or placed on a surface, preserve anatomically and physically correct contact, depth, occlusion, weight, and support. Keep hands, fingers, body parts, fixtures, and nearby objects on the correct side of the product boundary.
+
+Preserve all non-target content in image 1, including subject identity, anatomy, pose, clothing, environment, composition, camera viewpoint, and lighting. Do not add duplicate products, detached parts, extra objects, floating elements, or unrelated changes.</textarea><small><span id="imagePromptCount">0</span> / 2500</small></label>
+      <div class="actions"><span id="imageStatus">尚未开始</span><button id="startImageButton" class="primary" disabled>生成替换首帧</button></div>
+    </section>
+
+    <section>
+      <div class="section-heading"><div><p class="step">03 / 首帧确认</p><h2>检查商品替换结果</h2></div><span id="runId" class="run-id"></span></div>
+      <div class="preview-grid">
+        <div><p>原始首帧</p><div class="image-frame"><img id="firstFramePreview" alt="原始首帧"><span id="firstFrameEmpty">等待提取</span></div></div>
+        <div><p>Kling 替换首帧</p><div class="image-frame"><img id="editedImagePreview" alt="替换首帧"><span id="editedImageEmpty">等待 Kling 输出</span></div></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-heading"><div><p class="step">04 / 图生视频</p><h2>新站 MiniMax-H3-open</h2></div><code>POST /v1/video/generations</code></div>
+      <label class="field"><span>视频 Prompt</span><textarea id="videoPrompt" rows="10" maxlength="7000">Continue naturally from the provided first frame as one coherent, realistic shot. Treat the visible subjects, product, environment, composition, and spatial relationships in the first frame as authoritative.
+
+Preserve the identity and appearance of every visible subject and the replacement product throughout the video. Keep the product's silhouette, proportions, construction, colors, materials, distinctive details, branding, graphics, and artwork temporally consistent. Do not redesign, morph, duplicate, replace, or merge it with another object.
+
+Generate restrained, context-appropriate motion with realistic timing, inertia, weight, contact, and occlusion. The product must move according to the physical support visible in the first frame. If it is held, worn, touched, attached, inserted, or resting on a surface, maintain that relationship continuously unless a clearly described action changes it. A held product must move together with the supporting hand and wrist; it must never remain pinned to screen coordinates, drift, float, slide, or move independently.
+
+Keep the product on approximately the same depth plane, at the same camera distance, and at the same apparent on-screen size established by the first frame for the entire shot. Its visible size should remain nearly constant, with no forward movement along the camera axis. Keep the product fully inside its existing presentation area and preserve roughly the same amount of surrounding space around it.
+
+The supporting person or mechanism may make only small lateral or rotational display movements. Do not extend an arm toward the lens, bring the product forward, offer it to the viewer, push it into the foreground, or move it toward the center for emphasis. The camera must not push in, zoom toward, track toward, or reframe around the product. Do not create a product close-up, hero shot, lens-filling view, sudden enlargement, perspective exaggeration, or face obstruction. Preserve the balanced subject-to-product composition established in the first frame.
+
+If people are visible, preserve their identity, anatomy, clothing, and natural body mechanics. Allow only motions that are compatible with the existing pose and product interaction. Keep hands and fingers anatomically correct and maintain believable contact at all times.
+
+The primary visible person speaks naturally in Mandarin Chinese: "蓬松顺滑，从一瓶好洗发水开始。让秀发每天都柔亮有光泽！" Generate clear matching Mandarin speech with natural lip synchronization while preserving the person's identity and facial appearance.
+
+Maintain scene continuity, lighting direction, shadows, perspective, background geometry, and camera logic. Use a stable single shot with subtle natural camera motion only when appropriate. Do not introduce cuts, transitions, new subjects, new products, extra limbs, detached parts, floating objects, or unrelated scene changes. Do not alter visible text in the scene.</textarea><small><span id="videoPromptCount">0</span> / 7000</small></label>
+      <div class="control-row">
+        <label class="field"><span>分辨率</span><select id="resolution"><option value="480P">480P</option><option value="720P" selected>720P</option></select></label>
+        <label class="field"><span>输出时长</span><select id="duration"></select></label>
+        <div class="cost"><span>预计 H3-open 折后费用</span><strong id="cost">¥0.88</strong><small>按当前 0.35 倍（约 3.5 折）估算，Kling 图片另计</small></div>
+      </div>
+      <div class="actions"><span id="videoStatus">确认替换首帧后可提交</span><button id="startVideoButton" class="primary" disabled>确认首帧并生成视频</button></div>
+    </section>
+
+    <section>
+      <div class="section-heading"><div><p class="step">05 / 结果</p><h2>视频与运行记录</h2></div><a id="downloadLink" hidden download>下载视频</a></div>
+      <div class="metrics" aria-label="本次运行统计">
+        <div><span>总耗时</span><strong id="totalElapsed">--</strong></div>
+        <div><span>Kling 图片</span><strong id="imageElapsed">--</strong></div>
+        <div><span>H3 视频</span><strong id="videoElapsed">--</strong></div>
+        <div><span>实际费用 / Token</span><strong id="actualUsage">等待接口返回</strong></div>
+      </div>
+      <div class="video-frame"><video id="resultVideo" controls playsinline></video><span id="resultEmpty">等待生成结果</span></div>
+      <details><summary>查看当前 Run JSON</summary><pre id="runJson">{}</pre></details>
+      <div id="history" class="history"></div>
+    </section>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

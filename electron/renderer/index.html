@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>智能视频创作</title>
+  <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./remake.css">
+  <link rel="stylesheet" href="./annotations.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><img src="./assets/zhangyu-ai-logo.png" alt="章域 AI"><span>章域 AI</span><small>视频客户端</small></div>
+      <div class="runtime"><span id="serviceStatus">本地服务启动中</span><button id="openLogs" class="icon-button" type="button" title="查看运行目录">运行目录</button></div>
+    </header>
+    <div class="studio-shell">
+      <aside class="sidebar"><h2>功能选择</h2><nav id="navigation"></nav></aside>
+      <main id="workspace" class="workspace" aria-live="polite"></main>
+    </div>
+  </div>
+  <div id="toast" class="toast" role="status"></div>
+  <dialog id="mediaViewer" class="media-viewer" aria-labelledby="mediaViewerTitle">
+    <header>
+      <span><small>素材预览</small><strong id="mediaViewerTitle"></strong></span>
+      <button type="button" class="media-viewer__close" data-preview-close aria-label="关闭预览">×</button>
+    </header>
+    <div id="mediaViewerBody" class="media-viewer__body"></div>
+  </dialog>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

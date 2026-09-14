@@ -1,0 +1,21 @@
+[
+  {
+    "shotId": "shot_001",
+    "startSec": 0,
+    "endSec": 2.5,
+    "contentTitle": "展示商品外观",
+    "usageType": "商品展示",
+    "namedPath": "named_segments/001_展示商品外观_商品展示.mp4",
+    "namedFilename": "001_展示商品外观_商品展示.mp4"
+  },
+  {
+    "shotId": "shot_002",
+    "startSec": 2.5,
+    "endSec": 5,
+    "contentTitle": "演示商品使用方法",
+    "usageType": "使用演示",
+    "namedPath": "named_segments/002_演示商品使用方法_使用演示.mp4",
+    "namedFilename": "002_演示商品使用方法_使用演示.mp4"
+  }
+]
+

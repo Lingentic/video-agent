@@ -1,0 +1,23 @@
+{
+  "videoId": "video_002",
+  "sourceFilename": "示例失败.mp4",
+  "status": "failed",
+  "stage": "provider_processing_failed",
+  "failedStage": "provider_processing",
+  "error": "Request contains an invalid argument.",
+  "activeDurationMs": 9000,
+  "unknownCostAttempts": 0,
+  "providerAttempts": [
+    {
+      "requestNumber": 1,
+      "level": 1,
+      "repeat": 1,
+      "schemaMode": "json-response-schema",
+      "status": 400,
+      "outcome": "http_error",
+      "costStatus": "no_usage_returned",
+      "thinkingBudget": 0
+    }
+  ]
+}
+

@@ -1,0 +1,19 @@
+{
+  "videoId": "video_001",
+  "sourceFilename": "示例成功.mp4",
+  "status": "completed",
+  "stage": "completed",
+  "namedShotCount": 2,
+  "activeDurationMs": 12000,
+  "providerSuccessMode": "json-response-schema",
+  "providerSuccessRepeat": 1,
+  "unknownCostAttempts": 0,
+  "usage": {
+    "total_tokens": 1200,
+    "total_input_tokens": 1000,
+    "total_output_tokens": 200,
+    "total_thought_tokens": 0,
+    "estimated_cost_yuan": 0.003
+  }
+}
+
