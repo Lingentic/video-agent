@@ -18,6 +18,8 @@ client-data-*/
 **/runs/
 **/runs-v1/
 **/.runtime/
+**/__pycache__/
+*.py[cod]
 *.log
 *.pid
 *.tmp
@@ -29,6 +31,7 @@ release/
 
 # Bundled executables are too large for normal GitHub source storage
 packaging-resources/tools/**/*.exe
+wan3-video-demo/tools/
 
 # Old prototypes and unrelated local projects
 batch-results-current/

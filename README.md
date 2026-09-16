@@ -11,6 +11,7 @@
 | `electron/main.mjs` | Electron 窗口、IPC、本地服务和文件处理 |
 | `video-shot-engine-electron-delivery-20260904/` | 素材拆分与 Gemini 命名服务 |
 | `Kling-H3路线B-Electron交付包-20260904/module/` | 商品替换服务 |
+| `wan3-video-demo/` | Wan3 四视角人物替换独立试验；不属于 Electron 客户端启动流程 |
 | `scripts/` | 构建辅助脚本 |
 | `build/` | 客户端图标等构建资源 |
 | `packaging-resources/` | 第三方工具许可证；可执行文件不进入 Git 仓库 |
