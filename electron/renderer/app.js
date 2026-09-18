@@ -12,6 +12,7 @@ const videoClient = window.videoClient || {
   openLogs: async () => notify("浏览器预览模式下没有运行目录"),
   getKlingConfig: async () => ({ configured: false }),
   listKlingAssets: async () => ({ baseUrl: "", assets: [] }),
+  inspectReferenceAudio: async () => ({ hasAudio: false, duration: null }),
   createKlingRun: async () => { throw new Error("浏览器预览模式下不能运行产品替换"); },
   getKlingRun: async () => { throw new Error("浏览器预览模式下不能查询产品替换任务"); },
   startKlingVideo: async () => { throw new Error("浏览器预览模式下不能启动视频生成"); },
@@ -29,20 +30,22 @@ const videoClient = window.videoClient || {
   onServicesUpdated: () => () => {}
 };
 const tools = [
-  { id: "split", icon: "分", name: "素材分割", note: "素材清洗、分割与归档" },
-  { id: "remake", icon: "替", name: "产品替换", note: "按参考视频生成同款" },
-  { id: "audio", icon: "声", name: "音频处理", note: "声音克隆与去气口", available: false },
-  { id: "compose", icon: "合", name: "视频合成", note: "多类型素材智能成片", available: false },
-  { id: "library", icon: "库", name: "素材库", note: "统一管理创作素材" }
+  { id: "split", icon: `<svg viewBox="0 0 24 24"><path d="m8.5 8.5 10 10M8.5 15.5 18.5 5.5"/><circle cx="6" cy="7" r="2.5"/><circle cx="6" cy="17" r="2.5"/></svg>`, name: "素材分割", note: "素材清洗、分割与归档" },
+  { id: "remake", icon: `<svg viewBox="0 0 24 24"><path d="M5 8h13m0 0-3-3m3 3-3 3M19 16H6m0 0 3 3m-3-3 3-3"/></svg>`, name: "产品替换", note: "按参考视频生成同款" },
+  { id: "compose", icon: `<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="m10 9 5 3-5 3z"/></svg>`, name: "视频合成", note: "多类型素材智能成片", available: false },
+  { id: "library", icon: `<svg viewBox="0 0 24 24"><path d="M3 6.5h6l2 2h10v10H3z"/></svg>`, name: "素材库", note: "统一管理创作素材" }
 ];
 const state = {
   active: "split",
-  remake: { products: [], reference: null, duration: 5, ratio: "9:16", resolution: "768P", videoMode: "multi_keyframes", audio: "silent", voiceScript: "", progress: 0, routeIndex: 0, stage: "", runId: null, serviceBaseUrl: "", editedImage: null, editedKeyframes: [], keyframeTimes: [], selectedRetryIndexes: [], imageReady: false, result: null, error: null, config: null, running: false },
+  remake: { products: [], reference: null, duration: 5, ratio: "9:16", resolution: "768P", videoMode: "multi_keyframes", audio: "voice", voiceEnabled: true, voiceScript: "", voiceSource: "video", voiceSample: null, voiceDetected: null, progress: 0, routeIndex: 0, stage: "", runId: null, serviceBaseUrl: "", editedImage: null, editedKeyframes: [], keyframeTimes: [], selectedRetryIndexes: [], imageReady: false, result: null, error: null, config: null, running: false },
   split: { source: null, sources: [], mode: "ffmpeg_only", keepAudio: true, progress: 0, routeIndex: 0, stage: "", runId: null, serviceBaseUrl: "", result: null, error: null, config: null, running: false, batch: null },
   audio: { source: null, script: "", progress: 0, result: null },
   compose: { script: "", ratio: "9:16", resolution: "1080P", progress: 0, result: null },
   library: [],
-  libraryFilter: "all"
+  libraryFilter: "all",
+  libraryRunFilter: "all",
+  libraryRuns: [],
+  libraryView: { runId: null, categoryId: null }
 };
 const timers = new Map();
 let shotAssetsLoading = false;
@@ -76,7 +79,7 @@ function closeMediaViewer() {
 function sortLibraryNewestFirst() {
   state.library.sort((a, b) => (Date.parse(b.completedAt || "") || 0) - (Date.parse(a.completedAt || "") || 0));
 }
-function renderNavigation() { navigation.innerHTML = tools.map((tool) => { const unavailable = tool.available === false; return `<button class="${state.active === tool.id ? "active" : ""}${unavailable ? " is-unavailable" : ""}" data-tool="${tool.id}" data-tool-name="${tool.name}" ${unavailable ? 'data-unavailable="true" aria-disabled="true" title="暂未开放"' : ""} type="button"><i>${tool.icon}</i><span><strong>${tool.name}${unavailable ? "<em>暂未开放</em>" : ""}</strong><small>${tool.note}</small></span></button>`; }).join(""); }
+function renderNavigation() { navigation.innerHTML = tools.map((tool) => { const unavailable = tool.available === false; return `<button class="${state.active === tool.id ? "active" : ""}${unavailable ? " is-unavailable" : ""}" data-tool="${tool.id}" data-tool-name="${tool.name}" ${unavailable ? 'data-unavailable="true" aria-disabled="true" title="暂未开放"' : ""} type="button"><i aria-hidden="true">${tool.icon}</i><span><strong>${tool.name}${unavailable ? "<em>暂未开放</em>" : ""}</strong><small>${tool.note}</small></span></button>`; }).join(""); }
 function page(title, subtitle, controls, output, className = "") { return `<section class="tool-page ${className}"><div class="tool-layout"><aside class="control-panel">${controls}</aside><section class="output-panel">${output}</section></div></section>`; }
 function step(number, title, note, body) { return `<section class="step"><header><b>${number}</b><span><strong>${title}</strong>${note ? `<small>${note}</small>` : ""}</span></header>${body}</section>`; }
 function uploadBox(id, title, note, accept, multiple = false) { return `<label class="upload-box" for="${id}"><i>＋</i><strong>${title}</strong><small>${note}</small><em>选择文件</em><input id="${id}" type="file" accept="${accept}" ${multiple ? "multiple" : ""} hidden></label>`; }
@@ -136,12 +139,17 @@ function splitResultFrom(response) {
   const named = response.renameManifest || [];
   const shots = named.length ? named : run.shots || response.shots || [];
   return {
+    runId: run.runId || response.runId || state.split.runId,
+    workflow: named.length ? "ffmpeg_gemini_naming" : run.workflow || state.split.mode,
+    sourceFilename: run.sourceFilename || state.split.source?.name || "素材",
     mediaTools: run.mediaTools || response.mediaTools || null,
     keepAudio: run.keepAudio ?? response.keepAudio ?? state.split.keepAudio,
     clips: shots.map((shot, index) => ({
       id: shot.shotId || `shot_${index + 1}`,
       remoteKey: `${run.runId || response.runId || state.split.runId}:${shot.namedPath || shot.filePath || index}`,
       name: shot.namedFilename || `${shot.shotId || `片段_${index + 1}`}.mp4`,
+      usageType: shot.usageType || null,
+      contentTitle: shot.contentTitle || null,
       startSec: shot.startSec,
       endSec: shot.endSec,
       url: shotMediaUrl(response.baseUrl || state.split.serviceBaseUrl, run.runId || response.runId || state.split.runId, shot.namedPath || shot.filePath)
@@ -154,7 +162,7 @@ function addSplitResultsToLibrary(result) {
   const additions = [];
   for (const clip of result.clips) {
     if (state.library.some((item) => item.remoteKey === clip.remoteKey)) continue;
-    additions.push({ name: clip.name, url: clip.url, kind: "video", origin: "素材分割", remoteKey: clip.remoteKey, completedAt });
+    additions.push({ name: clip.name, url: clip.url, kind: "video", origin: "素材分割", remoteKey: clip.remoteKey, runId: result.runId, sourceId: result.runId, sourceFilename: result.sourceFilename, sourceFolderName: String(result.sourceFilename || "素材").replace(/\.[^.]+$/, ""), workflow: result.workflow, usageType: clip.usageType, contentTitle: clip.contentTitle, completedAt });
   }
   state.library.unshift(...additions);
   sortLibraryNewestFirst();
@@ -201,6 +209,8 @@ function batchFromResponse(response) {
         id: clip.shotId || `shot_${clipIndex + 1}`,
         remoteKey: `${sourceBatch.batchId}:items/${entry.videoId}/${relativePath || clipIndex}`,
         name: clip.namedFilename || `${clip.shotId || `片段_${clipIndex + 1}`}.mp4`,
+        usageType: clip.usageType || null,
+        contentTitle: clip.contentTitle || null,
         startSec: clip.startSec,
         endSec: clip.endSec,
         url: relativePath ? shotMediaUrl(response.baseUrl || state.split.serviceBaseUrl, sourceBatch.batchId, `items/${entry.videoId}/${relativePath}`) : ""
@@ -209,6 +219,7 @@ function batchFromResponse(response) {
     return {
       id: entry.videoId || `video_${index + 1}`,
       name: entry.sourceFilename || old?.name || `视频 ${index + 1}`,
+      sourceFilename: entry.sourceFilename || old?.name || `视频 ${index + 1}`,
       size: old?.size || "",
       status,
       rawStatus,
@@ -240,7 +251,7 @@ function addBatchResultsToLibrary(batch) {
     if (entry.status !== "completed") continue;
     for (const clip of entry.clips || []) {
       if (!clip.url || state.library.some((item) => item.remoteKey === clip.remoteKey)) continue;
-      additions.push({ name: clip.name, url: clip.url, kind: "video", origin: `素材分割 · ${entry.name}`, remoteKey: clip.remoteKey, completedAt: entry.completedAt || new Date().toISOString() });
+      additions.push({ name: clip.name, url: clip.url, kind: "video", origin: `素材分割 · ${entry.name}`, remoteKey: clip.remoteKey, runId: batch.id, sourceId: `${batch.id}:${entry.id}`, sourceFilename: entry.sourceFilename || entry.name, sourceFolderName: String(entry.sourceFilename || entry.name).replace(/\.[^.]+$/, ""), workflow: batch.mode, usageType: clip.usageType, contentTitle: clip.contentTitle, completedAt: entry.completedAt || new Date().toISOString() });
     }
   }
   state.library.unshift(...additions);
@@ -410,7 +421,10 @@ async function pollKlingRun() {
 async function runRemake({ retryVideo = false } = {}) {
   const item = state.remake;
   const referenceVideoMode = item.videoMode === "reference_video";
-  if (item.running || !item.reference || !item.products.length || (!referenceVideoMode && (!item.voiceScript.trim() || item.voiceScript.length > item.duration * 6))) return;
+  const outputAudioEnabled = referenceVideoMode ? item.audio === "voice" : item.voiceEnabled;
+  const voiceReferenceReady = item.voiceSource === "upload" ? Boolean(item.voiceSample) : item.voiceDetected?.hasAudio === true;
+  const voiceSettingsValid = !item.voiceEnabled || (Boolean(item.voiceScript.trim()) && item.voiceScript.length <= item.duration * 6 && voiceReferenceReady);
+  if (item.running || !item.reference || !item.products.length || (!referenceVideoMode && !voiceSettingsValid)) return;
   item.running = true;
   item.result = null;
   item.error = null;
@@ -419,14 +433,14 @@ async function runRemake({ retryVideo = false } = {}) {
     if (retryVideo && item.runId) {
       updateRemakeStage("video");
       render();
-      response = await videoClient.startKlingVideo(item.runId, item.voiceScript, item.videoMode, item.duration, item.keyframeTimes, true);
+      response = await videoClient.startKlingVideo(item.runId, outputAudioEnabled && !referenceVideoMode ? item.voiceScript : "", item.videoMode, item.duration, item.keyframeTimes, true, outputAudioEnabled);
       item.runId = response.id || item.runId;
       item.serviceBaseUrl = response.baseUrl || item.serviceBaseUrl;
     } else {
       item.runId = null;
       updateRemakeStage("upload");
       render();
-      response = await videoClient.createKlingRun(item.reference.file, item.products[0].file, item.voiceScript, item.audio, item.videoMode, item.duration);
+      response = await videoClient.createKlingRun(item.reference.file, item.products[0].file, item.voiceEnabled && !referenceVideoMode ? item.voiceScript : "", outputAudioEnabled ? "voice" : "silent", item.videoMode, item.duration, item.voiceSource, item.voiceSample?.file || null);
       item.runId = response.id;
       item.serviceBaseUrl = response.baseUrl;
     }
@@ -505,14 +519,16 @@ async function recoverRemake() {
 
 async function confirmRemakeImage() {
   const item = state.remake;
-  if (!item.runId || !item.imageReady || !item.editedKeyframes.length || item.running || item.voiceScript.length > item.duration * 6) return;
+  const voiceReferenceReady = item.voiceSource === "upload" ? Boolean(item.voiceSample) : item.voiceDetected?.hasAudio === true;
+  const voiceSettingsValid = !item.voiceEnabled || (Boolean(item.voiceScript.trim()) && item.voiceScript.length <= item.duration * 6 && voiceReferenceReady);
+  if (!item.runId || !item.imageReady || !item.editedKeyframes.length || item.running || !voiceSettingsValid) return;
   item.running = true;
   item.imageReady = false;
   item.error = null;
   updateRemakeStage("video");
   render();
   try {
-    await videoClient.startKlingVideo(item.runId, item.voiceScript, item.videoMode, item.duration, item.keyframeTimes);
+    await videoClient.startKlingVideo(item.runId, item.voiceEnabled ? item.voiceScript : "", item.videoMode, item.duration, item.keyframeTimes, false, item.voiceEnabled);
     const response = await pollKlingRun();
     updateRemakeStage("completed");
     const url = new URL(response.output.url, response.baseUrl || item.serviceBaseUrl).toString();
@@ -561,10 +577,28 @@ function renderRemake() {
   const durationOptions = options("remakeDuration", durationValues, durationLabel, item.running ? durationValues : []);
   const voiceLimit = item.duration * 6;
   const voiceWithinLimit = item.voiceScript.length <= voiceLimit;
+  const voiceEnabled = item.voiceEnabled !== false;
+  const voiceLocked = item.running || item.imageReady;
   const soundOptions = options("audio", ["无声音", "有声音"], item.audio === "voice" ? "有声音" : "无声音");
-  const voiceInput = referenceVideoMode ? "" : `<div class="voice-script ${voiceWithinLimit ? "" : "is-over-limit"}"><label for="remakeVoiceScript"><strong>台词</strong><small><b>${item.voiceScript.length}</b> / ${voiceLimit} 字</small></label><textarea id="remakeVoiceScript" maxlength="${voiceLimit}" placeholder="输入约 ${item.duration} 秒的台词，建议不超过 ${voiceLimit} 字">${esc(item.voiceScript)}</textarea></div>`;
+  const voiceSourceOptions = options("remakeVoiceSource", ["自动提取", "上传样本"], item.voiceSource === "upload" ? "上传样本" : "自动提取", voiceLocked ? ["自动提取", "上传样本"] : []);
+  const voiceReferenceReady = referenceVideoMode || !voiceEnabled || (item.voiceSource === "upload" ? Boolean(item.voiceSample) : item.voiceDetected?.hasAudio === true);
+  const automaticVoice = !item.reference
+    ? `<div class="voice-reference-card"><i><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h2l2-6 3 12 3-8 2 4h4"/></svg></i><span><strong>等待参考视频</strong><small>上传后将自动检测人声</small></span></div>`
+    : item.voiceDetected?.checking
+      ? `<div class="voice-reference-card"><i><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h2l2-6 3 12 3-8 2 4h4"/></svg></i><span><strong>正在检测参考视频声音</strong><small>只读取媒体信息，不会提交生成任务</small></span></div>`
+      : item.voiceDetected?.hasAudio === true
+        ? `<div class="voice-reference-card is-ready"><i><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h2l2-6 3 12 3-8 2 4h4"/></svg></i><span><strong>参考视频声音可用</strong><small>${esc(item.voiceDetected.detail || "生成前自动提取声音样本")}</small></span><em>已就绪</em></div>`
+        : `<div class="voice-reference-card is-error"><i>!</i><span><strong>没有检测到可用音轨</strong><small>请改用上传样本，或关闭声音与口型</small></span></div>`;
+  const uploadedVoice = item.voiceSample
+    ? `<div class="voice-reference-card is-ready"><i><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0-4-4m4 4 4-4M5 19h14"/></svg></i><span><strong>${esc(item.voiceSample.name)}</strong><small>${esc(item.voiceSample.meta || "声音样本已就绪")}</small></span><em>已就绪</em></div><label class="inline-action" for="voiceSampleInput">更换样本</label><input id="voiceSampleInput" type="file" accept="audio/*,.mp3,.wav,.m4a" ${voiceLocked ? "disabled" : ""} hidden>`
+    : `<label class="voice-sample-upload" for="voiceSampleInput"><i>＋</i><span><strong>上传声音样本</strong><small>MP3 / WAV / M4A · 建议单人清晰语音</small></span><input id="voiceSampleInput" type="file" accept="audio/*,.mp3,.wav,.m4a" ${voiceLocked ? "disabled" : ""} hidden></label>`;
+  const voiceInput = referenceVideoMode ? "" : `<div class="voice-control-stack"><div class="voice-setting-group"><small>口型音色</small>${voiceSourceOptions}</div>${item.voiceSource === "upload" ? uploadedVoice : automaticVoice}<div class="voice-script ${voiceWithinLimit ? "" : "is-over-limit"}"><label for="remakeVoiceScript"><strong>台词</strong><small><b>${item.voiceScript.length}</b> / ${voiceLimit} 字</small></label><textarea id="remakeVoiceScript" maxlength="${voiceLimit}" placeholder="输入约 ${item.duration} 秒的台词，建议不超过 ${voiceLimit} 字">${esc(item.voiceScript)}</textarea></div></div>`;
+  const voiceSettingsValid = !voiceEnabled || (Boolean(item.voiceScript.trim()) && voiceWithinLimit && voiceReferenceReady);
+  const voiceStep = referenceVideoMode
+    ? step(5, "声音", "", soundOptions)
+    : `<section class="step voice-step ${voiceEnabled ? "is-enabled" : "is-disabled"}"><header><b>5</b><span><strong>声音与口型</strong></span><button class="voice-toggle ${voiceEnabled ? "is-on" : ""}" data-action="toggle-remake-voice" type="button" role="switch" aria-checked="${voiceEnabled}" aria-label="${voiceEnabled ? "关闭声音与口型" : "开启声音与口型"}" ${voiceLocked ? "disabled" : ""}><i aria-hidden="true"></i></button></header><div class="voice-step__reveal" aria-hidden="${!voiceEnabled}"><div class="voice-step__reveal-inner">${voiceInput}</div></div></section>`;
   const ready = referenceVideoMode ? item.config?.klingConfigured === true : item.config?.configured === true;
-  const controls = `<header class="panel-heading"><h2>替换视频中的商品</h2>${referenceVideoMode ? "" : "<p>自动抽取并替换多张关键帧，确认后再生成视频。</p>"}</header><div class="panel-scroll">${step(1, "产品图", "单张产品图", item.products.length ? `<div class="image-grid single"><img src="${esc(item.products[0].url)}" alt="${esc(item.products[0].name)}"></div><label class="inline-action" for="productInput">重新选择</label><input id="productInput" type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" hidden>` : uploadBox("productInput", "上传产品图", "JPG / PNG / WEBP · 单张图片", "image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"))}${step(2, "参考视频", referenceVideoMode ? "输入视频需为 3–10 秒" : `建议与 ${item.duration} 秒输出时长一致`, item.reference ? `${mediaPreview(item.reference)}<label class="inline-action" for="referenceInput">替换视频</label><input id="referenceInput" type="file" accept="video/mp4,video/quicktime,.mp4,.mov" hidden>` : uploadBox("referenceInput", "上传参考视频", referenceVideoMode ? "MP4 / MOV · 3–10 秒" : `MP4 / MOV · 建议 ${item.duration} 秒`, "video/mp4,video/quicktime,.mp4,.mov"))}${step(3, "生成方式", referenceVideoMode ? referenceVideoReady ? "Kling 直接参考原视频的动作与镜头" : "首次生成时将自动连接临时公网通道" : "抽取 4–6 张关键帧并逐张替换", videoModeOptions)}${step(4, "输出规格", "", `<div class="duration-choice"><small>视频时长</small>${durationOptions}</div><div class="fixed-specs fixed-specs--two"><span><small>视频比例</small><strong>${videoRatio}</strong></span><span><small>分辨率</small><strong>${videoResolution}</strong></span></div>`)}${step(5, "声音", "", `${soundOptions}${voiceInput}`)}</div><footer class="submit"><button class="primary" data-action="remake-generate" ${!ready || item.running || item.imageReady || !item.products.length || !item.reference || (!referenceVideoMode && (!item.voiceScript.trim() || !voiceWithinLimit)) ? "disabled" : ""}>${item.running ? "正在生成…" : referenceVideoMode ? "直接生成替换视频 →" : "生成替换关键帧 →"}</button><small>${!ready ? `${referenceVideoMode ? "Kling" : "商品替换"}服务未配置` : !referenceVideoMode && !voiceWithinLimit ? `当前台词超过 ${item.duration} 秒建议上限，请缩短至 ${voiceLimit} 字以内` : item.products.length && item.reference ? `${referenceVideoMode ? referenceVideoReady ? "Kling 3.0 Omni 参考原视频和商品图" : "生成前会先连接 Cloudflare 临时通道" : "确认全部替换关键帧后再生成视频"} · ${item.duration} 秒 · ${videoRatio} · ${videoResolution} · ${referenceVideoMode ? item.audio === "voice" ? "保留原视频音轨" : "输出无声" : item.audio === "voice" ? "保留声音" : "生成口型后移除声音"}` : "请先上传产品图与参考视频"}</small></footer>`;
+  const controls = `<header class="panel-heading"><h2>替换视频中的商品</h2>${referenceVideoMode ? "" : "<p>自动抽取并替换多张关键帧，确认后再生成视频。</p>"}</header><div class="panel-scroll">${step(1, "产品图", "单张产品图", item.products.length ? `<div class="image-grid single"><img src="${esc(item.products[0].url)}" alt="${esc(item.products[0].name)}"></div><label class="inline-action" for="productInput">重新选择</label><input id="productInput" type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" hidden>` : uploadBox("productInput", "上传产品图", "JPG / PNG / WEBP · 单张图片", "image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"))}${step(2, "参考视频", referenceVideoMode ? "输入视频需为 3–10 秒" : `建议与 ${item.duration} 秒输出时长一致`, item.reference ? `${mediaPreview(item.reference)}<label class="inline-action" for="referenceInput">替换视频</label><input id="referenceInput" type="file" accept="video/mp4,video/quicktime,.mp4,.mov" hidden>` : uploadBox("referenceInput", "上传参考视频", referenceVideoMode ? "MP4 / MOV · 3–10 秒" : `MP4 / MOV · 建议 ${item.duration} 秒`, "video/mp4,video/quicktime,.mp4,.mov"))}${step(3, "生成方式", referenceVideoMode ? referenceVideoReady ? "Kling 直接参考原视频的动作与镜头" : "首次生成时将自动连接临时公网通道" : "抽取 4–6 张关键帧并逐张替换", videoModeOptions)}${step(4, "输出规格", "", `<div class="duration-choice"><small>视频时长</small>${durationOptions}</div><div class="fixed-specs fixed-specs--two"><span><small>视频比例</small><strong>${videoRatio}</strong></span><span><small>分辨率</small><strong>${videoResolution}</strong></span></div>`)}${voiceStep}</div><footer class="submit"><button class="primary" data-action="remake-generate" ${!ready || item.running || item.imageReady || !item.products.length || !item.reference || (!referenceVideoMode && !voiceSettingsValid) ? "disabled" : ""}>${item.running ? "正在生成…" : referenceVideoMode ? "直接生成替换视频 →" : "生成替换关键帧 →"}</button><small>${!ready ? `${referenceVideoMode ? "Kling" : "商品替换"}服务未配置` : !referenceVideoMode && voiceEnabled && !voiceReferenceReady ? "请准备口型参考声音" : !referenceVideoMode && voiceEnabled && !voiceWithinLimit ? `当前台词超过 ${item.duration} 秒建议上限，请缩短至 ${voiceLimit} 字以内` : item.products.length && item.reference ? `${referenceVideoMode ? referenceVideoReady ? "Kling 3.0 Omni 参考原视频和商品图" : "生成前会先连接 Cloudflare 临时通道" : "确认全部替换关键帧后再生成视频"} · ${item.duration} 秒 · ${videoRatio} · ${videoResolution} · ${referenceVideoMode ? item.audio === "voice" ? "保留原视频音轨" : "输出无声" : !voiceEnabled ? "不生成声音与口型" : "使用参考音色生成口型与声音"}` : "请先上传产品图与参考视频"}</small></footer>`;
   let output = referenceVideoMode
     ? `<header class="output-heading"><h2>参考视频 + 商品图 = 替换成片</h2></header><div class="equation"><span>参考视频</span><b>＋</b><span>商品图片</span><b>→</b><span class="accent">替换成片</span></div><div class="empty"><i>替</i><h3>准备产品图、参考视频和台词</h3><p>此模式直接生成成片，不经过关键帧确认。</p></div>`
     : `<header class="output-heading"><h2>多张替换关键帧生成成片</h2></header><div class="equation"><span>4–6 张关键帧</span><b>＋</b><span>商品图片</span><b>→</b><span class="accent">替换成片</span></div><div class="empty"><i>替</i><h3>准备产品图、参考视频和台词</h3><p>关键帧全部生成后会等待确认，再进入视频生成阶段。</p></div>`;
@@ -577,14 +611,54 @@ function renderRemake() {
   if (item.running) output = progressOutput(item.progress, referenceVideoMode ? ["上传素材", "读取参考内容", "生成替换视频", "整理最终成片"] : ["抽取关键帧", "逐张替换商品", "生成替换视频", "整理最终成片"], item.stage, "task-processing", item);
   if (item.imageReady && item.editedKeyframes.length) {
     const selectedRetryIndexes = item.selectedRetryIndexes || [];
-    output = `<header class="output-heading"><h2>请逐张确认商品替换是否正确</h2></header><div class="keyframe-review-grid">${item.editedKeyframes.map((frame, index) => { const selected = selectedRetryIndexes.includes(index); return `<article class="${selected ? "is-selected" : ""}"><img src="${esc(new URL(frame.url, item.serviceBaseUrl).toString())}" alt="替换关键帧 ${index + 1}"><span><strong>关键帧 ${index + 1}</strong><small>约 ${Number(item.keyframeTimes[index] || 0).toFixed(1)} 秒</small></span><button class="keyframe-select" data-action="toggle-remake-image" data-keyframe-index="${index}" type="button" aria-pressed="${selected}"><i aria-hidden="true">${selected ? "✓" : ""}</i>${selected ? "已选择" : "选择重做"}</button></article>`; }).join("")}</div><div class="confirm-actions"><button class="icon-button" data-action="retry-selected-remake-images" type="button" ${selectedRetryIndexes.length ? "" : "disabled"}>重新生成所选${selectedRetryIndexes.length ? `（${selectedRetryIndexes.length}）` : ""}</button><button class="primary" data-action="confirm-remake-image" type="button" ${voiceWithinLimit ? "" : "disabled"}>确认并生成 ${item.duration} 秒视频</button></div>`;
+    output = `<header class="output-heading"><h2>请逐张确认商品替换是否正确</h2></header><div class="keyframe-review-grid">${item.editedKeyframes.map((frame, index) => { const selected = selectedRetryIndexes.includes(index); return `<article class="${selected ? "is-selected" : ""}"><img src="${esc(new URL(frame.url, item.serviceBaseUrl).toString())}" alt="替换关键帧 ${index + 1}"><span><strong>关键帧 ${index + 1}</strong><small>约 ${Number(item.keyframeTimes[index] || 0).toFixed(1)} 秒</small></span><button class="keyframe-select" data-action="toggle-remake-image" data-keyframe-index="${index}" type="button" aria-pressed="${selected}"><i aria-hidden="true">${selected ? "✓" : ""}</i>${selected ? "已选择" : "选择重做"}</button></article>`; }).join("")}</div><div class="confirm-actions"><button class="icon-button" data-action="retry-selected-remake-images" type="button" ${selectedRetryIndexes.length ? "" : "disabled"}>重新生成所选${selectedRetryIndexes.length ? `（${selectedRetryIndexes.length}）` : ""}</button><button class="primary" data-action="confirm-remake-image" type="button" ${voiceSettingsValid ? "" : "disabled"}>确认并生成 ${item.duration} 秒视频</button></div>`;
   }
   if (item.result) output = `<header class="output-heading"><h2>产品替换已完成</h2></header><div class="result-video remake-final-video"><video src="${esc(item.result.url)}" controls></video></div>`;
   workspace.innerHTML = page("产品替换", "按参考视频生成同款", controls, output);
 }
 
+function renderFolderBatchSplit(item) {
+  const batch = item.batch;
+  const folders = batch.folders || [];
+  const allVideos = folders.flatMap((folder) => folder.videos || []);
+  const completedFolders = folders.filter((folder) => folder.status === "completed").length;
+  const completedVideos = allVideos.filter((video) => video.status === "completed").length;
+  const failedVideos = allVideos.filter((video) => video.status === "failed").length;
+  const processingFolder = folders.find((folder) => folder.status === "processing");
+  const selectedFolder = folders.find((folder) => folder.id === batch.selectedFolderId) || processingFolder || folders[0];
+  const selectedIndex = Math.max(0, folders.findIndex((folder) => folder.id === selectedFolder?.id));
+  const currentVideo = selectedFolder?.videos?.find((video) => video.status === "processing") || null;
+  const folderStatusText = { completed: "已完成", processing: "处理中", queued: "等待处理", partial: "部分完成" };
+  const videoStatusText = { completed: "已完成", processing: "处理中", queued: "等待处理", failed: "处理失败" };
+  const statusIcon = { completed: "✓", processing: "●", queued: "○", failed: "!" };
+  const stageIndex = currentVideo ? /naming_prepare|ffmpeg_completed/.test(currentVideo.stage) ? 1 : /ffmpeg_processing/.test(currentVideo.stage) ? 0 : /naming|analysis|provider|quota/.test(currentVideo.stage) ? 2 : 3 : 3;
+  const query = String(batch.folderQuery || "").trim().toLowerCase();
+  const visibleFolders = query ? folders.filter((folder) => folder.name.toLowerCase().includes(query)) : folders;
+  const activeFolderIndex = Math.max(0, folders.findIndex((folder) => folder.id === processingFolder?.id));
+  const selectedIsActive = selectedFolder?.id === processingFolder?.id;
+  const folderRail = `<aside class="folder-workbench-rail"><header><strong>${folders.length} 个商品文件夹</strong><b>${completedFolders} 已完成</b></header>${folders.length > 8 ? `<label class="folder-search"><i>⌕</i><input id="folderTaskSearch" value="${esc(batch.folderQuery || "")}" placeholder="查找文件夹" autocomplete="off"></label>` : ""}<div class="folder-rail-list">${visibleFolders.map((folder) => { const index = folders.indexOf(folder); const done = folder.videos.filter((video) => video.status === "completed").length; return `<button class="is-${folder.status} ${folder.id === selectedFolder?.id ? "active" : ""}" data-folder-task="${folder.id}" type="button"><i>${folder.status === "completed" ? "✓" : folder.status === "processing" ? "●" : String(index + 1).padStart(2, "0")}</i><span><strong>${esc(folder.name)}</strong><small>${done} / ${folder.videos.length} 个视频</small></span><em>${folderStatusText[folder.status]}</em></button>`; }).join("") || `<div class="folder-search-empty">没有匹配的文件夹</div>`}</div></aside>`;
+  let focusPanel = "";
+  if (selectedFolder?.status === "processing" && currentVideo) {
+    focusPanel = `<section class="folder-focus-card"><header><h2>${esc(currentVideo.name)}</h2></header>${processRoute(["检测镜头", "导出片段", "分析命名", "整理结果"], stageIndex)}</section>`;
+  }
+  const videoList = `<div class="folder-video-list workbench-video-list">${(selectedFolder?.videos || []).map((video, index) => {
+    const meta = video.status === "completed" ? `${video.clipCount} 个片段` : video.status === "queued" ? `第 ${index + 1} 个` : "";
+    const action = video.status === "failed" ? `<button class="icon-button" data-action="folder-retry-demo" type="button">重试</button>` : "";
+    return `<article class="is-${video.status}"><i>${statusIcon[video.status]}</i><span><strong>${esc(video.name)}</strong><small>${videoStatusText[video.status]}${video.detail ? ` · ${esc(video.detail)}` : ""}</small></span>${meta ? `<b>${meta}</b>` : ""}${action}</article>`;
+  }).join("")}</div>`;
+  const returnToActive = !selectedIsActive && processingFolder ? `<button class="folder-return-active" data-action="folder-return-active" type="button" aria-label="返回当前正在处理的任务 ${esc(processingFolder.name)}"><i>↩</i><strong>返回当前任务</strong></button>` : "";
+  const progressTrack = `<div class="folder-overall-track" aria-label="文件夹总体进度">${folders.map((folder) => `<i class="is-${folder.status}" title="${esc(folder.name)}"></i>`).join("")}</div>`;
+  const selectedStatusLabel = selectedFolder?.status === "queued" ? "等待中" : folderStatusText[selectedFolder?.status] || "等待中";
+  const detail = `<main class="folder-workbench-detail"><div class="folder-detail-content"><header class="folder-detail-header"><div class="folder-detail-title"><h1>${esc(selectedFolder?.name || "文件夹任务")}</h1><span class="is-${selectedFolder?.status || "queued"}">${selectedStatusLabel}</span></div></header>${focusPanel}<div class="folder-content-heading"><strong>视频按文件名顺序串行处理</strong></div>${videoList}</div>${returnToActive}</main>`;
+  const optionSummary = `<div class="folder-workbench-options"><strong>分割并命名</strong><strong>${batch.keepAudio ? "保留原声" : "去除声音"}</strong></div>`;
+  const canViewResults = selectedFolder?.status === "completed" && completedVideos > 0;
+  const resultAction = `<button class="folder-library-result" data-action="folder-result-demo" type="button" ${canViewResults ? 'title="查看结果"' : `disabled title="${selectedFolder?.status === "processing" ? "当前文件夹处理完成后可查看结果" : "当前文件夹尚未开始处理"}"`}><i><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5h6l2 2h10v10H3z"/></svg></i><strong>查看结果</strong></button>`;
+  workspace.innerHTML = `<section class="folder-workbench"><header class="folder-workbench-header"><h2>文件夹批量处理</h2>${optionSummary}${resultAction}${progressTrack}</header><div class="folder-workbench-body">${folderRail}${detail}</div></section>`;
+}
+
 function renderBatchSplit(item) {
   const batch = item.batch;
+  if (batch.folderMode) return renderFolderBatchSplit(item);
   const completed = batch.items.filter((entry) => entry.status === "completed").length;
   const processing = batch.items.filter((entry) => entry.status === "processing").length;
   const queued = batch.items.filter((entry) => entry.status === "queued").length;
@@ -667,15 +741,97 @@ function renderCompose() {
   workspace.innerHTML = page("视频合成", "多类型素材智能成片", controls, output);
 }
 
+function libraryAssetCard(item) {
+  return `<article class="asset-card previewable" tabindex="0" data-preview-url="${esc(item.url)}" data-preview-kind="${esc(item.kind)}" data-preview-name="${esc(item.name)}"><div class="asset-card__preview">${item.kind === "image" ? `<img src="${esc(item.url)}" alt="">` : item.kind === "audio" ? `<i>声</i>` : `<video src="${esc(item.url)}" preload="metadata"></video>`}</div><div class="asset-card__info"><strong title="${esc(item.name)}">${esc(item.name)}</strong><small>${esc(item.origin || "视频素材")}</small></div></article>`;
+}
+
+function libraryFolderCard(folder, attribute) {
+  const modes = {
+    split_named: { label: "分割并命名", icon: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg>` },
+    split_plain: { label: "仅分割", icon: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8.5 8.5 10 10M8.5 15.5 18.5 5.5"/><circle cx="6" cy="7" r="2.5"/><circle cx="6" cy="17" r="2.5"/></svg>` },
+    remake: { label: "商品替换", icon: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8h13m0 0-3-3m3 3-3 3M19 16H6m0 0 3 3m-3-3 3-3"/></svg>` }
+  };
+  const mode = modes[folder.kind];
+  const count = Number(folder.itemCount ?? folder.items?.length ?? 0);
+  const time = folder.completedAt ? new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(folder.completedAt)) : "";
+  const meta = folder.category ? `${count} 个视频` : `${time ? `${time} · ` : ""}${count} 个视频`;
+  const badge = mode ? `<em class="library-mode-badge">${mode.icon}<span>${mode.label}</span></em>` : "";
+  return `<button class="library-folder-card is-${esc(folder.kind || "category")}" ${attribute} type="button"><span class="library-folder-card__preview"><i aria-hidden="true"><b></b></i>${badge}</span><span class="library-folder-card__info"><strong>${esc(folder.name)}</strong><small>${meta}</small></span></button>`;
+}
+
+function libraryDateKey(value) {
+  return new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(value || 0));
+}
+
+function libraryDateLabel(key) {
+  const [year, month, day] = key.split("-").map(Number);
+  const today = libraryDateKey(new Date());
+  const label = `${month}月${day}日`;
+  return key === today ? `今天 · ${label}` : `${year === new Date().getFullYear() ? "" : `${year}年`}${label}`;
+}
+
+function derivedLibraryRuns() {
+  if (state.libraryRuns.length) return state.libraryRuns;
+  const groups = new Map();
+  for (const item of state.library) {
+    const sourceId = item.sourceId || item.runId || String(item.remoteKey || "").split(":")[0] || `local-${item.name}-${item.completedAt || "upload"}`;
+    const remake = item.workflow === "remake" || item.origin === "产品替换";
+    const named = !remake && (item.workflow === "ffmpeg_gemini_naming" || Boolean(item.usageType));
+    if (!groups.has(sourceId)) {
+      const sourceName = item.sourceFolderName || String(item.sourceFilename || item.name || "素材").replace(/\.[^.]+$/, "");
+      groups.set(sourceId, { id: sourceId, sourceFolderId: item.sourceFolderId || null, name: sourceName, kind: remake ? "remake" : named ? "split_named" : "split_plain", completedAt: item.completedAt, items: [], categories: named ? [] : null, categoryMap: named ? new Map() : null });
+    }
+    const group = groups.get(sourceId);
+    if (named) {
+      const categoryName = item.usageType || "其他素材";
+      if (!group.categoryMap.has(categoryName)) {
+        const category = { id: `${sourceId}:${categoryName}`, name: categoryName, items: [] };
+        group.categoryMap.set(categoryName, category);
+        group.categories.push(category);
+      }
+      group.categoryMap.get(categoryName).items.push(item);
+    } else {
+      group.items.push(item);
+    }
+  }
+  return [...groups.values()].map((group) => { delete group.categoryMap; return group; }).sort((a, b) => (Date.parse(b.completedAt || "") || 0) - (Date.parse(a.completedAt || "") || 0));
+}
+
 function renderLibrary() {
-  const filters = [{ id: "all", label: "全部" }, { id: "video", label: "视频" }, { id: "image", label: "图片" }, { id: "audio", label: "音频" }];
-  const visible = state.libraryFilter === "all" ? state.library : state.library.filter((item) => item.kind === state.libraryFilter);
-  const cards = visible.length ? visible.map((item) => `<article class="asset-card previewable" tabindex="0" data-preview-url="${esc(item.url)}" data-preview-kind="${esc(item.kind)}" data-preview-name="${esc(item.name)}"><div class="asset-card__preview">${item.kind === "image" ? `<img src="${esc(item.url)}" alt="">` : item.kind === "audio" ? `<i>声</i>` : `<video src="${esc(item.url)}" preload="metadata"></video>`}</div><div class="asset-card__info"><strong title="${esc(item.name)}">${esc(item.name)}</strong><small>${esc(item.origin)}</small></div></article>`).join("") : `<div class="library-empty"><i>库</i><h2>${state.library.length ? "没有这一类型的素材" : "素材库暂时为空"}</h2><p>${state.library.length ? "切换其他分类查看素材。" : "当前可上传临时素材。后续将改为读取用户选择的本地目录。"}</p></div>`;
-  const tabs = filters.map((filter) => {
-    const count = filter.id === "all" ? state.library.length : state.library.filter((item) => item.kind === filter.id).length;
-    return `<button type="button" data-library-filter="${filter.id}" class="${state.libraryFilter === filter.id ? "active" : ""}">${filter.label} <small>${count}</small></button>`;
-  }).join("");
-  workspace.innerHTML = `<section class="library-page"><header><span><small>共享基础能力</small><h1>素材库</h1><p>统一查看产品替换、素材分割、音频处理和视频合成使用的素材。</p></span><label class="primary upload-button" for="libraryInput">＋ 上传临时素材<input id="libraryInput" type="file" accept="video/*,audio/*,image/*" multiple hidden></label></header><nav class="library-tabs">${tabs}</nav><div class="asset-grid">${cards}</div></section>`;
+  const runs = derivedLibraryRuns();
+  const currentRun = runs.find((run) => run.id === state.libraryView.runId) || null;
+  const currentCategory = currentRun?.categories?.find((category) => category.id === state.libraryView.categoryId) || null;
+  let tabs = "";
+  let breadcrumb = `<strong>素材库</strong>`;
+  let cards = "";
+
+  if (!currentRun) {
+    const filters = [
+      { id: "all", label: "全部" },
+      { id: "split", label: "素材拆分" },
+      { id: "remake", label: "商品替换" }
+    ];
+    const visibleRuns = runs.filter((run) => state.libraryRunFilter === "all" || (state.libraryRunFilter === "split" ? run.kind.startsWith("split") : run.kind === "remake"));
+    tabs = `<nav class="library-tabs">${filters.map((filter) => { const count = filter.id === "all" ? runs.length : runs.filter((run) => filter.id === "split" ? run.kind.startsWith("split") : run.kind === "remake").length; return `<button type="button" data-library-run-filter="${filter.id}" class="${state.libraryRunFilter === filter.id ? "active" : ""}">${filter.label} <small>${count}</small></button>`; }).join("")}</nav>`;
+    const dateGroups = new Map();
+    for (const run of visibleRuns) {
+      const key = libraryDateKey(run.completedAt);
+      if (!dateGroups.has(key)) dateGroups.set(key, []);
+      dateGroups.get(key).push(run);
+    }
+    cards = visibleRuns.length ? [...dateGroups.entries()].map(([key, entries]) => `<section class="library-date-group"><header><strong>${libraryDateLabel(key)}</strong><i></i></header><div class="asset-grid">${entries.map((run) => libraryFolderCard({ ...run, itemCount: run.categories ? run.categories.reduce((sum, category) => sum + category.items.length, 0) : run.items.length }, `data-library-run="${esc(run.id)}"`)).join("")}</div></section>`).join("") : `<div class="library-empty"><i>库</i><h2>素材库暂时为空</h2><p>完成素材拆分或商品替换后，结果文件夹会显示在这里。</p></div>`;
+  } else if (currentRun.kind === "split_named" && !currentCategory) {
+    breadcrumb = `<button data-library-home type="button">素材库</button><i>›</i><strong>${esc(currentRun.name)}</strong>`;
+    cards = currentRun.categories.map((category) => libraryFolderCard({ ...category, kind: "category", category: true, itemCount: category.items.length }, `data-library-category="${esc(category.id)}"`)).join("");
+  } else {
+    const items = currentCategory?.items || currentRun.items || [];
+    breadcrumb = `<button data-library-home type="button">素材库</button><i>›</i>${currentCategory ? `<button data-library-run="${esc(currentRun.id)}" type="button">${esc(currentRun.name)}</button><i>›</i><strong>${esc(currentCategory.name)}</strong>` : `<strong>${esc(currentRun.name)}</strong>`}`;
+    cards = items.length ? items.map(libraryAssetCard).join("") : `<div class="library-empty"><i>库</i><h2>文件夹中暂无素材</h2></div>`;
+  }
+
+  const backButton = currentRun ? `<button class="library-back-button" data-library-back type="button" aria-label="返回上一级" title="返回上一级"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11.5 5.5 5 12l6.5 6.5M5 12h14"/></svg></button>` : "";
+  const contentClass = currentRun ? "asset-grid library-content-grid" : "library-date-list";
+  workspace.innerHTML = `<section class="library-page"><header><span><h1>素材库</h1><p>按日期和来源文件夹查看本地结果。</p></span><label class="primary upload-button" for="libraryInput">＋ 上传临时素材<input id="libraryInput" type="file" accept="video/*,audio/*,image/*" multiple hidden></label></header><div class="library-pathbar">${backButton}<div class="library-breadcrumb">${breadcrumb}</div></div>${tabs}<div class="${contentClass}">${cards}</div></section>`;
 }
 
 function markOverflowingNames() {
@@ -743,6 +899,20 @@ document.addEventListener("click", (event) => {
   if (event.target.closest("[data-preview-close]")) { closeMediaViewer(); return; }
   const libraryFilter = event.target.closest("[data-library-filter]")?.dataset.libraryFilter;
   if (libraryFilter) { state.libraryFilter = libraryFilter; render(); return; }
+  const libraryRunFilter = event.target.closest("[data-library-run-filter]")?.dataset.libraryRunFilter;
+  if (libraryRunFilter) { state.libraryRunFilter = libraryRunFilter; render(); return; }
+  if (event.target.closest("[data-library-back]")) {
+    state.libraryView = state.libraryView.categoryId ? { runId: state.libraryView.runId, categoryId: null } : { runId: null, categoryId: null };
+    render({ preserveScroll: false });
+    return;
+  }
+  const libraryRun = event.target.closest("[data-library-run]")?.dataset.libraryRun;
+  if (libraryRun) { state.libraryView = { runId: libraryRun, categoryId: null }; render({ preserveScroll: false }); return; }
+  const libraryCategory = event.target.closest("[data-library-category]")?.dataset.libraryCategory;
+  if (libraryCategory) { state.libraryView.categoryId = libraryCategory; render({ preserveScroll: false }); return; }
+  if (event.target.closest("[data-library-home]")) { state.libraryView = { runId: null, categoryId: null }; render({ preserveScroll: false }); return; }
+  const folderTask = event.target.closest("[data-folder-task]")?.dataset.folderTask;
+  if (folderTask && state.split.batch?.folderMode) { state.split.batch.selectedFolderId = folderTask; render(); return; }
   const batchFilter = event.target.closest("[data-batch-filter]")?.dataset.batchFilter;
   if (batchFilter && state.split.batch) { state.split.batch.filter = batchFilter; render(); return; }
   const toolButton = event.target.closest("[data-tool]");
@@ -756,9 +926,9 @@ document.addEventListener("click", (event) => {
   }
   const option = event.target.closest("[data-option]");
   if (option) {
-    const map = { audio: ["remake", "audio"], remakeVideoMode: ["remake", "videoMode"], remakeDuration: ["remake", "duration"], splitMode: ["split", "mode"], splitAudio: ["split", "keepAudio"], composeRatio: ["compose", "ratio"], composeResolution: ["compose", "resolution"] };
+    const map = { audio: ["remake", "audio"], remakeVoiceSource: ["remake", "voiceSource"], remakeVideoMode: ["remake", "videoMode"], remakeDuration: ["remake", "duration"], splitMode: ["split", "mode"], splitAudio: ["split", "keepAudio"], composeRatio: ["compose", "ratio"], composeResolution: ["compose", "resolution"] };
     const [section, field] = map[option.dataset.option];
-    const values = { "无声音": "silent", "有声音": "voice", "关键帧生成": "multi_keyframes", "参考视频生成": "reference_video", "5 秒": 5, "8 秒": 8, "10 秒": 10, "15 秒": 15, "分割": "ffmpeg_only", "分割并命名": "ffmpeg_gemini_naming", "保留原声": true, "去除声音": false };
+    const values = { "无声音": "silent", "有声音": "voice", "自动提取": "video", "上传样本": "upload", "关键帧生成": "multi_keyframes", "参考视频生成": "reference_video", "5 秒": 5, "8 秒": 8, "10 秒": 10, "15 秒": 15, "分割": "ffmpeg_only", "分割并命名": "ffmpeg_gemini_naming", "保留原声": true, "去除声音": false };
     const value = values[option.dataset.value] ?? option.dataset.value;
     if (option.dataset.option === "remakeVideoMode" && state.remake.videoMode !== value) {
       Object.assign(state.remake, { runId: null, editedImage: null, editedKeyframes: [], keyframeTimes: [], selectedRetryIndexes: [], imageReady: false, result: null, error: null, progress: 0, stage: "" });
@@ -776,6 +946,29 @@ document.addEventListener("click", (event) => {
     videoClient.openWorkspace(action === "open-kling" ? "kling" : "shot").catch((error) => notify(error.message));
     return;
   }
+  if (action === "toggle-remake-voice") {
+    if (state.remake.running || state.remake.imageReady) return;
+    const enabled = !state.remake.voiceEnabled;
+    state.remake.voiceEnabled = enabled;
+    state.remake.audio = enabled ? "voice" : "silent";
+    const toggle = event.target.closest("[data-action='toggle-remake-voice']");
+    const voiceStep = toggle.closest(".voice-step");
+    const reveal = voiceStep.querySelector(".voice-step__reveal");
+    voiceStep.classList.toggle("is-enabled", enabled);
+    voiceStep.classList.toggle("is-disabled", !enabled);
+    toggle.classList.toggle("is-on", enabled);
+    toggle.setAttribute("aria-checked", String(enabled));
+    toggle.setAttribute("aria-label", enabled ? "关闭声音与口型" : "开启声音与口型");
+    reveal.setAttribute("aria-hidden", String(!enabled));
+    const voiceLimit = state.remake.duration * 6;
+    const voiceReferenceReady = state.remake.voiceSource === "upload" ? Boolean(state.remake.voiceSample) : state.remake.voiceDetected?.hasAudio === true;
+    const voiceSettingsValid = !enabled || (Boolean(state.remake.voiceScript.trim()) && state.remake.voiceScript.length <= voiceLimit && voiceReferenceReady);
+    const generateButton = document.querySelector('[data-action="remake-generate"]');
+    if (generateButton) generateButton.disabled = state.remake.config?.configured !== true || state.remake.running || state.remake.imageReady || !state.remake.products.length || !state.remake.reference || !voiceSettingsValid;
+    const submitNote = document.querySelector(".submit small");
+    if (submitNote && state.remake.products.length && state.remake.reference && state.remake.config?.configured === true) submitNote.textContent = `确认全部替换关键帧后再生成视频 · ${state.remake.duration} 秒 · 9:16 · 768P · ${enabled ? "使用参考音色生成口型与声音" : "不生成声音与口型"}`;
+    return;
+  }
   if (action === "retry-remake") { void recoverRemake(); return; }
   if (action === "retry-remake-paid") {
     if (!window.confirm("这会重新提交失败阶段并可能再次计费，是否继续？")) return;
@@ -787,6 +980,22 @@ document.addEventListener("click", (event) => {
   if (action === "batch-view-result" && state.split.batch) { state.split.batch.selectedVideoId = event.target.closest("[data-action]")?.dataset.videoId || null; render(); return; }
   if (action === "batch-back" && state.split.batch) { state.split.batch.selectedVideoId = null; render(); return; }
   if (action === "batch-retry-demo") { notify("预览模式：只会重试当前失败视频"); return; }
+  if (action === "folder-retry-demo") { notify("预览模式：只重试这个失败视频，不重复处理其他视频"); return; }
+  if (action === "folder-result-demo") {
+    const selectedFolder = state.split.batch?.folders?.find((folder) => folder.id === state.split.batch.selectedFolderId);
+    const targetRun = derivedLibraryRuns().find((run) => run.sourceFolderId === selectedFolder?.id || run.name === selectedFolder?.name);
+    if (!targetRun) { notify("当前批次暂时没有可查看的结果"); return; }
+    state.active = "library";
+    state.libraryView = { runId: targetRun.id, categoryId: null };
+    render({ preserveScroll: false });
+    return;
+  }
+  if (action === "folder-return-active" && state.split.batch?.folderMode) {
+    const activeFolder = state.split.batch.folders.find((folder) => folder.status === "processing");
+    if (activeFolder) state.split.batch.selectedFolderId = activeFolder.id;
+    render();
+    return;
+  }
   if (action === "batch-retry-item") { void runSplitBatch({ retryVideoId: event.target.closest("[data-action]")?.dataset.videoId }); return; }
   if (action === "batch-resume") { void runSplitBatch({ resume: true }); return; }
   if (action === "batch-new") { Object.assign(state.split, { source: null, sources: [], runId: null, result: null, error: null, batch: null, progress: 0, stage: "" }); render(); return; }
@@ -837,6 +1046,14 @@ mediaViewer.addEventListener("close", () => {
   previewOpener = null;
 });
 document.addEventListener("input", (event) => {
+  if (event.target.id === "folderTaskSearch" && state.split.batch?.folderMode) {
+    state.split.batch.folderQuery = event.target.value;
+    const query = event.target.value.trim().toLowerCase();
+    document.querySelectorAll(".folder-rail-list [data-folder-task]").forEach((button) => {
+      button.hidden = Boolean(query) && !button.textContent.toLowerCase().includes(query);
+    });
+    return;
+  }
   if (event.target.id === "remakeVoiceScript") {
     state.remake.voiceScript = event.target.value;
     const voiceLimit = state.remake.duration * 6;
@@ -845,7 +1062,8 @@ document.addEventListener("input", (event) => {
     const count = document.querySelector(".voice-script label b");
     if (count) count.textContent = event.target.value.length;
     const button = document.querySelector('[data-action="remake-generate"]');
-    if (button) button.disabled = state.remake.config?.configured !== true || state.remake.running || !state.remake.products.length || !state.remake.reference || !event.target.value.trim() || !voiceWithinLimit;
+    const voiceReferenceReady = state.remake.voiceSource === "upload" ? Boolean(state.remake.voiceSample) : state.remake.voiceDetected?.hasAudio === true;
+    if (button) button.disabled = state.remake.config?.configured !== true || state.remake.running || !state.remake.products.length || !state.remake.reference || !event.target.value.trim() || !voiceWithinLimit || !voiceReferenceReady;
     return;
   }
   if (event.target.id === "audioScript") state.audio.script = event.target.value;
@@ -855,13 +1073,33 @@ document.addEventListener("input", (event) => {
   const counter = event.target.nextElementSibling;
   if (counter?.classList.contains("counter")) counter.textContent = `${event.target.value.length} / 1000`;
 });
-document.addEventListener("change", (event) => {
+document.addEventListener("change", async (event) => {
   const files = [...(event.target.files || [])];
   if (!files.length) return;
   if (event.target.id === "productInput" || event.target.id === "referenceInput") {
     if (event.target.id === "productInput") state.remake.products = [addFile(files[0], "image", "产品替换")];
-    else state.remake.reference = addFile(files[0], "video", "产品替换");
+    else {
+      const reference = addFile(files[0], "video", "产品替换");
+      state.remake.reference = reference;
+      state.remake.voiceDetected = { checking: true, hasAudio: false, detail: "正在检测参考视频声音" };
+      Object.assign(state.remake, { runId: null, editedImage: null, editedKeyframes: [], keyframeTimes: [], imageReady: false, result: null, error: null, progress: 0, stage: "" });
+      render();
+      try {
+        const info = await videoClient.inspectReferenceAudio(files[0]);
+        if (state.remake.reference !== reference) return;
+        state.remake.voiceDetected = { checking: false, hasAudio: info.hasAudio === true, duration: info.duration, detail: info.hasAudio ? `检测到可用音轨${info.duration ? ` · ${Number(info.duration).toFixed(1)} 秒` : ""}` : "未检测到音轨" };
+      } catch (error) {
+        if (state.remake.reference !== reference) return;
+        state.remake.voiceDetected = { checking: false, hasAudio: false, detail: error.message };
+      }
+      render();
+      return;
+    }
     Object.assign(state.remake, { runId: null, editedImage: null, editedKeyframes: [], keyframeTimes: [], imageReady: false, result: null, error: null, progress: 0, stage: "" });
+  }
+  if (event.target.id === "voiceSampleInput") {
+    state.remake.voiceSample = { name: files[0].name, url: mediaUrl(files[0]), file: files[0], meta: `${formatFileSize(files[0].size)} · 声音样本` };
+    Object.assign(state.remake, { runId: null, result: null, error: null, progress: 0, stage: "" });
   }
   if (event.target.id === "splitInput") {
     const selected = files.slice(0, 25).map((file) => ({ name: file.name, url: mediaUrl(file), kind: "video", origin: "素材分割输入", file, size: formatFileSize(file.size) }));
@@ -895,7 +1133,7 @@ async function loadShotAssets() {
       const url = shotMediaUrl(response.baseUrl, asset.runId, asset.relativePath);
       const remoteKey = `${asset.runId}:${asset.relativePath}`;
       if (state.library.some((item) => item.remoteKey === remoteKey)) continue;
-      state.library.push({ name: asset.name, url, kind: "video", origin: asset.sourceFilename ? `素材分割 · ${asset.sourceFilename}` : "素材分割", remoteKey, startSec: asset.startSec, endSec: asset.endSec, completedAt: asset.completedAt });
+      state.library.push({ name: asset.name, url, kind: "video", origin: asset.sourceFilename ? `素材分割 · ${asset.sourceFilename}` : "素材分割", remoteKey, runId: asset.runId, sourceId: asset.sourceId, sourceFolderId: asset.sourceFolderId, sourceFolderName: asset.sourceFolderName, sourceFilename: asset.sourceFilename, workflow: asset.workflow, usageType: asset.usageType, contentTitle: asset.contentTitle, startSec: asset.startSec, endSec: asset.endSec, completedAt: asset.completedAt });
     }
     sortLibraryNewestFirst();
     if (state.active === "library") render();
@@ -936,7 +1174,7 @@ async function loadKlingAssets() {
     for (const asset of response.assets || []) {
       const remoteKey = `${asset.runId}:${asset.relativeUrl}`;
       if (state.library.some((item) => item.remoteKey === remoteKey)) continue;
-      state.library.push({ name: asset.name, url: new URL(asset.relativeUrl, response.baseUrl).toString(), kind: "video", origin: "产品替换", remoteKey, completedAt: asset.completedAt });
+      state.library.push({ name: asset.name, url: new URL(asset.relativeUrl, response.baseUrl).toString(), kind: "video", origin: "产品替换", remoteKey, runId: asset.runId, sourceId: asset.sourceId, sourceFolderName: asset.sourceFolderName, sourceFilename: asset.sourceFilename, workflow: "remake", completedAt: asset.completedAt });
     }
     sortLibraryNewestFirst();
     if (state.active === "library") render();

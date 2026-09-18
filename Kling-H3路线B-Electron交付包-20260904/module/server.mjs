@@ -69,6 +69,7 @@ function mediaCategory(value) {
   const categories = new Map([
     ["inputs/source-video", join("inputs", "source-video")],
     ["inputs/product-image", join("inputs", "product-image")],
+    ["inputs/voice-audio", join("inputs", "voice-audio")],
     ["first-frame", "first-frame"],
     ["keyframes/source", join("keyframes", "source")],
     ["kling-output", "kling-output"],
@@ -80,16 +81,16 @@ function mediaCategory(value) {
 }
 
 async function ensureRunLayout(runId) {
-  for (const category of [join("inputs", "source-video"), join("inputs", "product-image"), "first-frame", join("keyframes", "source"), "kling-output", "output"]) {
+  for (const category of [join("inputs", "source-video"), join("inputs", "product-image"), join("inputs", "voice-audio"), "first-frame", join("keyframes", "source"), "kling-output", "output"]) {
     await mkdir(join(RUNS_DIR, runId, category), { recursive: true });
   }
 }
 
 function allowedMedia(kind, mime, name) {
   const ext = extname(name).toLowerCase();
-  return kind === "video"
-    ? ["video/mp4", "video/quicktime"].includes(mime) || [".mp4", ".mov"].includes(ext)
-    : ["image/jpeg", "image/png", "image/webp"].includes(mime) || [".jpg", ".jpeg", ".png", ".webp"].includes(ext);
+  if (kind === "video") return ["video/mp4", "video/quicktime"].includes(mime) || [".mp4", ".mov"].includes(ext);
+  if (kind === "audio") return ["audio/mpeg", "audio/wav", "audio/x-wav", "audio/mp4", "audio/x-m4a"].includes(mime) || [".mp3", ".wav", ".m4a"].includes(ext);
+  return ["image/jpeg", "image/png", "image/webp"].includes(mime) || [".jpg", ".jpeg", ".png", ".webp"].includes(ext);
 }
 
 function publicMedia(item) {
@@ -102,6 +103,7 @@ function publicRun(run) {
     ...run,
     sourceVideo: publicMedia(run.sourceVideo),
     productImage: publicMedia(run.productImage),
+    voiceAudio: publicMedia(run.voiceAudio),
     firstFrame: publicMedia(run.firstFrame),
     editedImage: publicMedia(run.editedImage),
     keyframes: (run.keyframes || []).map(publicMedia),
@@ -133,7 +135,7 @@ function ensureRunMetrics(run) {
 }
 
 function indexRunMedia(run) {
-  for (const item of [run.sourceVideo, run.productImage, run.firstFrame, run.editedImage, ...(run.keyframes || []), ...(run.editedKeyframes || []), ...(run.imageTasks || []).map((task) => task.editedImage), run.output]) {
+  for (const item of [run.sourceVideo, run.productImage, run.voiceAudio, run.firstFrame, run.editedImage, ...(run.keyframes || []), ...(run.editedKeyframes || []), ...(run.imageTasks || []).map((task) => task.editedImage), run.output]) {
     if (item?.id && item?.path) media.set(item.id, item);
   }
 }
@@ -177,10 +179,10 @@ async function logRun(run, event, fields = {}) {
 
 async function receiveMedia(req, kind, runId, category, originalName) {
   const mime = String(req.headers["content-type"] || "application/octet-stream").split(";")[0];
-  const name = safePart(originalName, kind === "video" ? "source.mp4" : "image.png");
-  if (!allowedMedia(kind, mime, name)) throw new HttpError(415, kind === "video" ? "视频仅支持 MP4/MOV" : "图片仅支持 JPG/PNG/WebP");
+  const name = safePart(originalName, kind === "video" ? "source.mp4" : kind === "audio" ? "voice.mp3" : "image.png");
+  if (!allowedMedia(kind, mime, name)) throw new HttpError(415, kind === "video" ? "视频仅支持 MP4/MOV" : kind === "audio" ? "声音样本仅支持 MP3/WAV/M4A" : "图片仅支持 JPG/PNG/WebP");
   const id = randomUUID();
-  const ext = extname(name) || (kind === "video" ? ".mp4" : ".png");
+  const ext = extname(name) || (kind === "video" ? ".mp4" : kind === "audio" ? ".mp3" : ".png");
   const dir = join(RUNS_DIR, runId, category);
   await mkdir(dir, { recursive: true });
   const path = join(dir, `${id}${ext}`);
@@ -217,6 +219,25 @@ async function cloneMediaItem(item, runId, category) {
   const cloned = { ...item, id, path, size: info.size, category };
   media.set(id, cloned);
   return cloned;
+}
+
+async function extractVoiceAudio(sourceVideo, runId, maxSeconds = 15) {
+  if (!sourceVideo?.path) throw new HttpError(400, "参考视频不存在，无法提取声音");
+  const id = randomUUID();
+  const category = join("inputs", "voice-audio");
+  const dir = join(RUNS_DIR, runId, category);
+  const path = join(dir, `${id}.mp3`);
+  await mkdir(dir, { recursive: true });
+  try {
+    await execFileAsync(FFMPEG_PATH, ["-y", "-i", sourceVideo.path, "-map", "0:a:0", "-t", String(Math.min(15, Math.max(1, Number(maxSeconds) || 15))), "-vn", "-ac", "1", "-ar", "24000", "-c:a", "libmp3lame", "-b:a", "96k", path], { windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+  } catch {
+    throw new HttpError(422, "参考视频没有可提取的音轨，请关闭声音与口型或改用上传样本");
+  }
+  const info = await stat(path);
+  if (!info.size) throw new HttpError(422, "从参考视频提取的声音样本为空，请改用上传样本");
+  const item = { id, name: "reference-voice.mp3", mime: "audio/mpeg", size: info.size, path, category, extractedFrom: sourceVideo.id };
+  media.set(id, item);
+  return item;
 }
 
 async function providerFetch(base, path, key, provider, options = {}) {
@@ -435,7 +456,12 @@ async function createVideoStage(run) {
   const videoModel = videoModelForMode(run.videoMode);
   if (!referenceMode && !multiKeyframeMode && !run.editedImage?.remoteUrl && !MOCK) throw new HttpError(409, "替换首帧缺少可供 H3 访问的公网 URL");
   if (multiKeyframeMode && (!run.editedKeyframes?.length || run.editedKeyframes.some((item) => !item?.remoteUrl)) && !MOCK) throw new HttpError(409, "替换关键帧尚未全部完成");
+  if (!referenceMode && run.audioMode === "voice" && !run.voiceAudio) throw new HttpError(409, "声音与口型已开启，但缺少参考声音");
+  if (!referenceMode && run.audioMode === "voice" && !run.publicBaseUrl && !MOCK) throw new HttpError(409, "参考声音公网通道未就绪");
   const content = [{ type: "text", text: run.videoPrompt }];
+  const voiceAudioUrl = !referenceMode && run.audioMode === "voice"
+    ? MOCK ? "https://mock.invalid/reference-voice.mp3" : new URL(publicMedia(run.voiceAudio).url, run.publicBaseUrl).toString()
+    : null;
   let referenceUrls = null;
   if (referenceMode) {
     if (!run.publicBaseUrl && !MOCK) throw new HttpError(409, "Cloudflare 临时公网通道未就绪");
@@ -469,6 +495,7 @@ async function createVideoStage(run) {
     model: videoModel,
     prompt: run.videoPrompt,
     images: (run.editedKeyframes || []).map((item, index) => ({ url: MOCK ? `https://mock.invalid/keyframe-${index + 1}.png` : item.remoteUrl, role: "reference_image" })),
+    ...(voiceAudioUrl ? { audios: [voiceAudioUrl] } : {}),
     resolution: run.resolution,
     duration: run.duration,
     ratio: run.ratio || "9:16"
@@ -479,7 +506,7 @@ async function createVideoStage(run) {
     contents: request.contents.map((item) => item.type === "base_video"
       ? { ...item, url: "[Cloudflare reference video URL]" }
       : item.type === "refer_image" ? { ...item, url: "[Cloudflare product image URL]" } : item)
-  } : multiKeyframeMode ? { ...request, images: request.images.map((_, index) => ({ url: `[Kling keyframe ${index + 1} URL]`, role: "reference_image" })) } : {
+  } : multiKeyframeMode ? { ...request, images: request.images.map((_, index) => ({ url: `[Kling keyframe ${index + 1} URL]`, role: "reference_image" })), ...(request.audios ? { audios: ["[Cloudflare reference audio URL]"] } : {}) } : {
     ...request,
     content: request.content.map((item) => item.type === "image_url"
       ? { ...item, image_url: { url: referenceMode ? "[Cloudflare product image URL]" : "[Kling result URL]" } }
@@ -515,9 +542,10 @@ async function createVideoVariant(source, videoPrompt, duration, resolution, vid
   const id = makeRunId();
   const now = new Date().toISOString();
   await ensureRunLayout(id);
-  const [sourceVideo, productImage, firstFrame, editedImage] = await Promise.all([
+  const [sourceVideo, productImage, voiceAudio, firstFrame, editedImage] = await Promise.all([
     cloneMediaItem(source.sourceVideo, id, join("inputs", "source-video")),
     cloneMediaItem(source.productImage, id, join("inputs", "product-image")),
+    cloneMediaItem(source.voiceAudio, id, join("inputs", "voice-audio")),
     cloneMediaItem(source.firstFrame, id, "first-frame"),
     cloneMediaItem(source.editedImage, id, "kling-output")
   ]);
@@ -531,8 +559,8 @@ async function createVideoVariant(source, videoPrompt, duration, resolution, vid
     lineage: { type: "video_rerun", sourceRunId: source.id, reusedEditedImage: videoMode === "first_frame", reusedEditedKeyframes: videoMode === "multi_keyframes", sourceImageTaskId: source.imageTaskId || null },
     status: "submitting", stage: "video", message: videoMode === "reference_video" ? "已复用参考素材，准备重新提交 Kling 3.0 Omni" : videoMode === "multi_keyframes" ? "已复用替换关键帧，准备提交 H3" : "已复用替换首帧，准备提交 H3", createdAt: now, updatedAt: now,
     imageModel: videoMode === "reference_video" ? null : source.imageModel || KLING_IMAGE_MODEL, videoModel,
-    imagePrompt: source.imagePrompt || null, videoPrompt, resolution, duration, ratio: source.ratio || "9:16", videoMode, audioMode: source.audioMode || "voice", voiceScript: source.voiceScript || "",
-    estimatedVideoCostCny, sourceVideo, productImage, firstFrame, editedImage, keyframes, editedKeyframes, keyframeTimes: source.keyframeTimes || [], imageTasks: [], output: null,
+    imagePrompt: source.imagePrompt || null, videoPrompt, resolution, duration, ratio: source.ratio || "9:16", videoMode, publicBaseUrl: source.publicBaseUrl || null, audioMode: source.audioMode || "voice", voiceSource: source.voiceSource || "source_video", voiceScript: source.voiceScript || "",
+    estimatedVideoCostCny, sourceVideo, productImage, voiceAudio, firstFrame, editedImage, keyframes, editedKeyframes, keyframeTimes: source.keyframeTimes || [], imageTasks: [], output: null,
     imageTaskId: videoMode === "reference_video" ? null : source.imageTaskId || null, imageStatus: videoMode === "reference_video" ? "SKIPPED" : "SUCCEEDED", imageReused: videoMode !== "reference_video",
     videoTaskId: null, videoStatus: null, imageRequest: null, imageLastResponse: null, videoRequest: null, videoLastResponse: null,
     timing: { runStartedAt: now, imageStartedAt: null, imageSubmittedAt: null, imageCompletedAt: null, imageElapsedMs: null, videoStartedAt: null, videoSubmittedAt: null, videoCompletedAt: null, videoElapsedMs: null, totalElapsedMs: null },
@@ -749,11 +777,13 @@ const server = http.createServer(async (req, res) => {
       if (runId === "invalid") throw new HttpError(400, "缺少 runId");
       const run = runs.get(runId);
       if (!run) throw new HttpError(404, "Run 不存在，请先创建 Run ID");
-      const kind = url.searchParams.get("kind") === "video" ? "video" : "image";
+      const requestedKind = url.searchParams.get("kind");
+      const kind = requestedKind === "video" ? "video" : requestedKind === "audio" ? "audio" : "image";
       const category = mediaCategory(url.searchParams.get("category"));
       const item = await receiveMedia(req, kind, runId, category, url.searchParams.get("name"));
       if (category === join("inputs", "source-video")) run.sourceVideo = item;
       else if (category === join("inputs", "product-image")) run.productImage = item;
+      else if (category === join("inputs", "voice-audio")) run.voiceAudio = item;
       else if (category === "first-frame") run.firstFrame = item;
       else if (category === join("keyframes", "source")) (run.keyframes ||= []).push(item);
       run.updatedAt = new Date().toISOString();
@@ -774,8 +804,9 @@ const server = http.createServer(async (req, res) => {
       const videoModel = videoModelForMode(videoMode);
       const allowedResolutions = videoResolutionsForMode(videoMode);
       const publicBaseInput = String(body.publicBaseUrl || "").trim();
-      const publicBaseUrl = videoMode === "reference_video" && publicBaseInput ? publicBaseInput.replace(/\/?$/, "/") : null;
+      const publicBaseUrl = publicBaseInput ? publicBaseInput.replace(/\/?$/, "/") : null;
       const audioMode = body.audioMode === "silent" ? "silent" : "voice";
+      const voiceSource = body.voiceSource === "upload" ? "upload" : "source_video";
       const voiceScript = String(body.voiceScript || "").trim();
       if (!imagePrompt || imagePrompt.length > 2500) throw new HttpError(400, "图片 Prompt 必填且不能超过 2500 字符");
       if (!videoPrompt || videoPrompt.length > 7000) throw new HttpError(400, "视频 Prompt 必填且不能超过 7000 字符");
@@ -783,18 +814,38 @@ const server = http.createServer(async (req, res) => {
       if (!Number.isInteger(duration) || duration < 4 || duration > 15) throw new HttpError(400, "输出时长必须是 4-15 秒整数");
       if (videoMode === "reference_video" && ![5, 10, 15].includes(duration)) throw new HttpError(400, "Kling 3.0 Omni 参考视频模式仅支持 5、10 或 15 秒");
       if (!allowedResolutions.includes(resolution)) throw new HttpError(400, `当前生成方式分辨率必须是 ${allowedResolutions.join(" 或 ")}`);
+      if (videoMode !== "reference_video" && audioMode === "voice" && !voiceScript) throw new HttpError(400, "声音与口型开启时必须填写台词");
+      if (videoMode !== "reference_video" && audioMode === "voice" && !publicBaseUrl && !MOCK) throw new HttpError(400, "声音与口型开启时必须提供参考声音公网通道");
+      const sourceVideo = requireMedia(body.sourceVideoId, "video/", "原视频");
+      const uploadedVoiceAudio = videoMode !== "reference_video" && audioMode === "voice" && voiceSource === "upload"
+        ? requireMedia(body.voiceAudioId, "audio/", "声音样本")
+        : null;
       Object.assign(run, {
         status: "submitting", stage: videoMode === "reference_video" ? "video" : "image", message: videoMode === "reference_video" ? "准备提交 Kling 3.0 Omni 参考视频任务" : videoMode === "multi_keyframes" ? "准备提交多张关键帧替换任务" : "准备提交 Kling Image O1", updatedAt: new Date().toISOString(),
-        imageModel: videoMode === "reference_video" ? null : KLING_IMAGE_MODEL, videoModel, imagePrompt, videoPrompt, resolution, duration, ratio: videoMode === "reference_video" ? "adaptive" : "9:16", videoMode, publicBaseUrl, audioMode, voiceScript,
+        imageModel: videoMode === "reference_video" ? null : KLING_IMAGE_MODEL, videoModel, imagePrompt, videoPrompt, resolution, duration, ratio: videoMode === "reference_video" ? "adaptive" : "9:16", videoMode, publicBaseUrl, audioMode, voiceSource, voiceScript,
         estimatedVideoCostCny: estimatedH3Cost(duration, resolution, videoModel),
-        sourceVideo: requireMedia(body.sourceVideoId, "video/", "原视频"),
+        sourceVideo,
         productImage: requireMedia(body.productImageId, "image/", "商品图片"),
+        voiceAudio: uploadedVoiceAudio,
         firstFrame: videoMode === "first_frame" ? requireMedia(body.firstFrameId, "image/", "首帧图片") : null,
         keyframes: videoMode === "multi_keyframes" ? (Array.isArray(body.keyframeIds) ? body.keyframeIds : []).map((mediaId) => requireMedia(mediaId, "image/", "关键帧图片")) : [],
         keyframeTimes: videoMode === "multi_keyframes" && Array.isArray(body.keyframeTimes) ? body.keyframeTimes.map(Number) : [],
         editedImage: null, editedKeyframes: [], imageTasks: [], output: null, imageTaskId: null, imageStatus: null, videoTaskId: null, videoStatus: null,
         imageRequest: null, imageLastResponse: null, videoRequest: null, videoLastResponse: null
       });
+      if (videoMode !== "reference_video" && audioMode === "voice" && voiceSource === "source_video") {
+        try {
+          run.voiceAudio = await extractVoiceAudio(sourceVideo, id, duration);
+        } catch (error) {
+          run.status = "FAILED";
+          run.stage = "upload";
+          run.message = error.message;
+          run.updatedAt = new Date().toISOString();
+          await persistRun(run);
+          await logRun(run, "voice_audio_extract_failed", { message: error.message });
+          throw error;
+        }
+      }
       if (videoMode === "multi_keyframes" && (run.keyframes.length < 2 || run.keyframes.length > 9)) throw new HttpError(400, "多参考关键帧必须为 2-9 张");
       run.billing.estimate.videoAmount = run.estimatedVideoCostCny;
       if (videoMode === "reference_video") Object.assign(run.billing.estimate, { provider: "kling", currency: "credits", basis: "provider_task_receipt", discount: null });
@@ -835,7 +886,7 @@ const server = http.createServer(async (req, res) => {
       const videoModel = videoModelForMode(requestedVideoMode);
       const allowedResolutions = videoResolutionsForMode(requestedVideoMode);
       const publicBaseInput = String(body.publicBaseUrl || "").trim();
-      const publicBaseUrl = requestedVideoMode === "reference_video" && publicBaseInput ? publicBaseInput.replace(/\/?$/, "/") : null;
+      const publicBaseUrl = publicBaseInput ? publicBaseInput.replace(/\/?$/, "/") : sourceRun.publicBaseUrl || null;
       if (requestedVideoMode === "first_frame" && (!sourceRun.editedImage || normalized(sourceRun.imageStatus) !== "succeeded")) throw new HttpError(409, "请先完成并确认替换首帧");
       if (requestedVideoMode === "multi_keyframes" && (!sourceRun.editedKeyframes?.length || sourceRun.editedKeyframes.some((item) => !item) || normalized(sourceRun.imageStatus) !== "succeeded")) throw new HttpError(409, "请先完成并确认全部替换关键帧");
       if (sourceRun.videoTaskId && ["submitted", "processing", "pending", "in_progress"].includes(normalized(sourceRun.videoStatus))) throw new HttpError(409, "当前视频任务仍在处理中");
@@ -851,6 +902,8 @@ const server = http.createServer(async (req, res) => {
       if (!allowedResolutions.includes(resolution)) throw new HttpError(400, `当前生成方式分辨率必须是 ${allowedResolutions.join(" 或 ")}`);
       const run = sourceRun.videoTaskId ? await createVideoVariant(sourceRun, videoPrompt, duration, resolution, videoMode) : sourceRun;
       run.videoPrompt = videoPrompt;
+      run.voiceScript = String(body.voiceScript ?? run.voiceScript ?? "").trim();
+      run.audioMode = body.audioMode === "silent" ? "silent" : run.audioMode || "voice";
       run.duration = duration;
       run.resolution = resolution;
       run.videoMode = videoMode;

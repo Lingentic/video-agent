@@ -8,16 +8,19 @@ contextBridge.exposeInMainWorld("videoClient", {
   openLogs: () => ipcRenderer.invoke("open-logs"),
   getKlingConfig: () => ipcRenderer.invoke("kling-get-config"),
   listKlingAssets: () => ipcRenderer.invoke("kling-list-assets"),
-  createKlingRun: (videoFile, productFile, voiceScript, audioMode, videoMode, duration) => ipcRenderer.invoke("kling-create-run", {
+  createKlingRun: (videoFile, productFile, voiceScript, audioMode, videoMode, duration, voiceSource, voiceSampleFile) => ipcRenderer.invoke("kling-create-run", {
     videoPath: webUtils.getPathForFile(videoFile),
     productPath: webUtils.getPathForFile(productFile),
+    voiceSamplePath: voiceSampleFile ? webUtils.getPathForFile(voiceSampleFile) : null,
     voiceScript,
     audioMode,
     videoMode,
-    duration
+    duration,
+    voiceSource
   }),
   getKlingRun: (runId) => ipcRenderer.invoke("kling-get-run", runId),
-  startKlingVideo: (runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit = false) => ipcRenderer.invoke("kling-start-video", runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit),
+  startKlingVideo: (runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit = false, voiceEnabled = true) => ipcRenderer.invoke("kling-start-video", runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit, voiceEnabled),
+  inspectReferenceAudio: (videoFile) => ipcRenderer.invoke("kling-inspect-reference-audio", webUtils.getPathForFile(videoFile)),
   resumeKlingRun: (runId) => ipcRenderer.invoke("kling-resume-run", runId),
   retryKlingImage: (runId, indexes) => ipcRenderer.invoke("kling-retry-image", runId, indexes),
   getShotConfig: () => ipcRenderer.invoke("shot-get-config"),

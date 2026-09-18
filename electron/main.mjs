@@ -206,6 +206,9 @@ function klingVideoPrompt(script, videoMode = "first_frame", duration = 5, keyfr
   const seconds = normalizeKlingDuration(duration);
   if (videoMode === "multi_keyframes") {
     const anchors = keyframeTimes.map((time, index) => `<Picture ${index + 1}> is the verified scene and product anchor for approximately ${Number(time).toFixed(2)} seconds.`).join("\n");
+    const speechGuidance = script
+      ? `Human motion is limited to the natural interpolation already implied by adjacent pictures, plus lip and jaw movement required for the exact dialogue, subtle blinking, breathing, and micro-expressions. Preserve identity, face, anatomy, clothing, hands, environment, background geometry, lighting, shadows, and all existing visible text. Use exactly one shot with no cut, transition, new scene, new subject, new object, extra limb, unrelated action, or sudden motion.\n\nThe supplied reference audio defines the speaker's timbre, vocal identity, cadence, accent, and delivery style. The only permitted spoken content is: <d>[Chinese] ${script}</d>. Treat it as a strict word-for-word whitelist. Never add, omit, translate, rewrite, paraphrase, repeat, extend, or improvise words. Add no greeting, filler, additional dialogue, singing, subtitle, caption, or new on-screen text. Do not extend speech to fill ${seconds} seconds; after the line ends, lips stop and the remainder is quiet.\n\noverall_soundscape:\nQuiet natural ambience consistent with the supplied pictures, with only the exact specified Mandarin dialogue. No additional speech or attention-directing sound.`
+      : `Human motion is limited to the natural interpolation already implied by adjacent pictures, subtle blinking, breathing, and micro-expressions. Preserve identity, face, anatomy, clothing, hands, environment, background geometry, lighting, shadows, and all existing visible text. Use exactly one shot with no cut, transition, new scene, new subject, new object, extra limb, unrelated action, or sudden motion. Every visible person remains silent with closed or naturally resting lips. Do not generate speech, vocalization, singing, subtitle, caption, or new on-screen text.\n\noverall_soundscape:\nNo speech or vocalization. Any generated ambience must remain unobtrusive; the exported result will be delivered without an audio track.`;
     return `subject_definitions:
 <Subject 1> is the same replacement product shown consistently across all reference pictures. Every picture provides a verified appearance and scene-placement reference for this single product.
 ${anchors}
@@ -221,12 +224,7 @@ The target is one continuous live-action shot. The reference pictures are ordere
 
 The camera and product depth must follow the supplied pictures without adding emphasis. Do not introduce a push-in, zoom, close-up, reframing, focus pull, product reveal, presentation gesture, arm extension, or movement toward the viewer unless that exact change is already established by two adjacent pictures. Never make the product larger or closer than it appears in either adjacent anchor. Do not flip, mirror, turn over, spin, rotate, redesign, morph, stretch, compress, duplicate, simplify, detach, float, or merge <Subject 1> with another object.
 
-Human motion is limited to the natural interpolation already implied by adjacent pictures, plus lip and jaw movement required for the exact dialogue, subtle blinking, breathing, and micro-expressions. Preserve identity, face, anatomy, clothing, hands, environment, background geometry, lighting, shadows, and all existing visible text. Use exactly one shot with no cut, transition, new scene, new subject, new object, extra limb, unrelated action, or sudden motion.
-
-The only permitted spoken content is: <d>[Chinese] ${script}</d>. Treat it as a strict word-for-word whitelist. Never add, omit, translate, rewrite, paraphrase, repeat, extend, or improvise words. Add no greeting, filler, additional dialogue, singing, subtitle, caption, or new on-screen text. Do not extend speech to fill ${seconds} seconds; after the line ends, lips stop and the remainder is quiet.
-
-overall_soundscape:
-Quiet natural ambience consistent with the supplied pictures, with only the exact specified Mandarin dialogue. No additional speech or attention-directing sound.
+${speechGuidance}
 
 non_diegetic_music:
 N/A`;
@@ -294,6 +292,11 @@ async function getKlingConfig() {
 function mediaType(filePath, kind) {
   const extension = path.extname(filePath).toLowerCase();
   if (kind === "video") return extension === ".mov" ? "video/quicktime" : "video/mp4";
+  if (kind === "audio") {
+    if (extension === ".wav") return "audio/wav";
+    if (extension === ".m4a") return "audio/mp4";
+    return "audio/mpeg";
+  }
   if (extension === ".webp") return "image/webp";
   if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
   return "image/png";
@@ -315,15 +318,34 @@ async function videoDurationSeconds(videoPath) {
   return duration;
 }
 
+async function inspectReferenceAudio(videoPath) {
+  if (!videoPath) throw new Error("请先选择参考视频");
+  const { stdout } = await execFileAsync(ffprobeCommand(), ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-show_entries", "format=duration", "-of", "json", videoPath], { windowsHide: true, encoding: "utf8", maxBuffer: 1024 * 1024 });
+  const result = JSON.parse(stdout || "{}");
+  const duration = Number(result?.format?.duration || 0);
+  return {
+    hasAudio: Array.isArray(result?.streams) && result.streams.length > 0,
+    duration: Number.isFinite(duration) && duration > 0 ? duration : null,
+    codec: result?.streams?.[0]?.codec_name || null
+  };
+}
+
 function keyframeCount(duration) {
   return duration <= 5 ? 4 : duration <= 10 ? 5 : 6;
 }
 
-async function createKlingRun({ videoPath, productPath, voiceScript, audioMode, videoMode, duration }) {
+async function createKlingRun({ videoPath, productPath, voiceScript, audioMode, videoMode, duration, voiceSource, voiceSamplePath }) {
   if (!videoPath || !productPath) throw new Error("请先选择产品图和参考视频");
   const selectedVideoMode = videoMode === "reference_video" ? "reference_video" : "multi_keyframes";
   const script = selectedVideoMode === "reference_video" ? "" : String(voiceScript || "").trim();
-  if (selectedVideoMode !== "reference_video" && !script) throw new Error("请输入台词");
+  const voiceEnabled = selectedVideoMode !== "reference_video" && audioMode !== "silent";
+  const selectedVoiceSource = voiceSource === "upload" ? "upload" : "source_video";
+  if (voiceEnabled && !script) throw new Error("声音与口型开启时请输入台词");
+  if (voiceEnabled && selectedVoiceSource === "upload" && !voiceSamplePath) throw new Error("请先上传声音样本");
+  if (voiceEnabled && selectedVoiceSource === "source_video") {
+    const audioInfo = await inspectReferenceAudio(videoPath);
+    if (!audioInfo.hasAudio) throw new Error("参考视频没有可提取的音轨，请关闭声音与口型或改用上传样本");
+  }
   const config = await klingRequest("api/config");
   if (selectedVideoMode === "reference_video" ? !config.klingConfigured : !config.configured) throw new Error(selectedVideoMode === "reference_video" ? "Kling API Key 尚未配置" : "商品替换服务尚未配置两个 API Key");
   const selectedDuration = normalizeKlingDuration(duration);
@@ -342,6 +364,7 @@ async function createKlingRun({ videoPath, productPath, voiceScript, audioMode, 
     return klingRequest("api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId, sourceVideoId: sourceVideo.id, productImageId: productImage.id, imagePrompt: KLING_IMAGE_PROMPT, videoPrompt, voiceScript: script, audioMode: audioMode === "silent" ? "silent" : "voice", videoMode: selectedVideoMode, publicBaseUrl, resolution: "720P", duration: selectedDuration }) });
   }
   const { runId } = await klingRequest("api/run-id", { method: "POST" });
+  const publicBaseUrl = voiceEnabled ? await ensureQuickTunnel(getReadyKlingService()) : null;
   const tempDir = path.join(app.getPath("temp"), "video-client-electron", "keyframes", runId);
   await mkdir(tempDir, { recursive: true });
   try {
@@ -358,21 +381,25 @@ async function createKlingRun({ videoPath, productPath, voiceScript, audioMode, 
       uploadKlingMedia(runId, productPath, "image", "inputs/product-image"),
       ...keyframePaths.map((filePath, index) => uploadKlingMedia(runId, filePath, "image", "keyframes/source", `keyframe-${index + 1}.png`))
     ]);
-    return klingRequest("api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId, sourceVideoId: sourceVideo.id, productImageId: productImage.id, keyframeIds: keyframes.map((item) => item.id), keyframeTimes, imagePrompt: KLING_IMAGE_PROMPT, videoPrompt: klingVideoPrompt(script, selectedVideoMode, selectedDuration, keyframeTimes), voiceScript: script, audioMode: audioMode === "silent" ? "silent" : "voice", videoMode: selectedVideoMode, resolution: "768P", duration: selectedDuration }) });
+    const voiceAudio = voiceEnabled && selectedVoiceSource === "upload"
+      ? await uploadKlingMedia(runId, voiceSamplePath, "audio", "inputs/voice-audio")
+      : null;
+    return klingRequest("api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId, sourceVideoId: sourceVideo.id, productImageId: productImage.id, voiceAudioId: voiceAudio?.id || null, voiceSource: selectedVoiceSource, keyframeIds: keyframes.map((item) => item.id), keyframeTimes, imagePrompt: KLING_IMAGE_PROMPT, videoPrompt: klingVideoPrompt(script, selectedVideoMode, selectedDuration, keyframeTimes), voiceScript: script, audioMode: voiceEnabled ? "voice" : "silent", videoMode: selectedVideoMode, publicBaseUrl, resolution: "768P", duration: selectedDuration }) });
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
 }
 
-async function startKlingVideo(runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit = false) {
+async function startKlingVideo(runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit = false, voiceEnabled = true) {
   const selectedVideoMode = videoMode === "reference_video" ? "reference_video" : "multi_keyframes";
   const selectedDuration = normalizeKlingDuration(duration);
-  const publicBaseUrl = selectedVideoMode === "reference_video" ? await ensureQuickTunnel(getReadyKlingService()) : null;
+  const publicBaseUrl = selectedVideoMode === "reference_video" || voiceEnabled ? await ensureQuickTunnel(getReadyKlingService()) : null;
   if (selectedVideoMode === "reference_video" && !klingOmniDurations.has(selectedDuration)) throw new Error("Kling 3.0 Omni 参考视频模式仅支持 5、10 或 15 秒");
   const resolution = selectedVideoMode === "reference_video" ? "720P" : "768P";
-  const videoPrompt = klingVideoPrompt(String(voiceScript || "").trim(), selectedVideoMode, selectedDuration, Array.isArray(keyframeTimes) ? keyframeTimes : []);
+  const normalizedVoiceScript = voiceEnabled ? String(voiceScript || "").trim() : "";
+  const videoPrompt = klingVideoPrompt(normalizedVoiceScript, selectedVideoMode, selectedDuration, Array.isArray(keyframeTimes) ? keyframeTimes : []);
   if (selectedVideoMode === "reference_video" && Buffer.byteLength(videoPrompt, "utf8") > KLING_OMNI_PROMPT_MAX_BYTES) throw new Error("Kling 3.0 Omni 提示词超过 3072 字节，请缩短台词");
-  return klingRequest(`api/runs/${encodeURIComponent(runId)}/video`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ videoPrompt, videoMode: selectedVideoMode, publicBaseUrl, resolution, duration: selectedDuration, confirmResubmit }) });
+  return klingRequest(`api/runs/${encodeURIComponent(runId)}/video`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ videoPrompt, voiceScript: normalizedVoiceScript, audioMode: voiceEnabled ? "voice" : "silent", videoMode: selectedVideoMode, publicBaseUrl, resolution, duration: selectedDuration, confirmResubmit }) });
 }
 
 async function resumeKlingRun(runId) {
@@ -387,7 +414,7 @@ async function listKlingAssets() {
   const response = await klingRequest("api/runs");
   return {
     baseUrl: response.baseUrl,
-    assets: (response.runs || []).filter((run) => run.stage === "video" && String(run.status).toUpperCase() === "SUCCEEDED" && run.output?.url).map((run) => ({ runId: run.id, name: run.output.name || "商品替换成片.mp4", relativeUrl: run.output.url, completedAt: run.updatedAt || run.createdAt, audioMode: run.audioMode || "voice" }))
+    assets: (response.runs || []).filter((run) => run.stage === "video" && String(run.status).toUpperCase() === "SUCCEEDED" && run.output?.url).map((run) => ({ runId: run.id, sourceId: run.id, sourceFilename: run.sourceVideo?.name || "商品替换", sourceFolderName: path.parse(run.sourceVideo?.name || "商品替换").name, workflow: "remake", name: run.output.name || "商品替换成片.mp4", relativeUrl: run.output.url, completedAt: run.updatedAt || run.createdAt, audioMode: run.audioMode || "voice" }))
   };
 }
 
@@ -455,11 +482,16 @@ async function listShotAssets() {
           const item = JSON.parse(await readFile(path.join(itemDir, "item.json"), "utf8"));
           if (item.status !== "completed") continue;
           let clips = item.shots || [];
-          try { clips = JSON.parse(await readFile(path.join(itemDir, "artifacts", "rename_manifest.json"), "utf8")); } catch {}
+          let named = false;
+          try { clips = JSON.parse(await readFile(path.join(itemDir, "artifacts", "rename_manifest.json"), "utf8")); named = true; } catch {}
+          const sourceFilename = item.sourceFilename || itemRef.sourceFilename || "素材";
+          const sourceFolderName = item.sourceFolderName || path.parse(sourceFilename).name;
+          const sourceId = item.sourceFolderId || `${batch.batchId || entry.name}:${item.videoId}`;
+          const workflow = item.workflow || batch.workflow || (named ? "ffmpeg_gemini_naming" : "ffmpeg_only");
           for (const clip of clips) {
             const itemRelativePath = clip.namedPath || clip.filePath;
             if (!itemRelativePath) continue;
-            assets.push({ runId: batch.batchId || entry.name, relativePath: path.posix.join("items", item.videoId, String(itemRelativePath).replaceAll("\\", "/")), name: clip.namedFilename || `${clip.shotId || "片段"}.mp4`, startSec: clip.startSec, endSec: clip.endSec, sourceFilename: item.sourceFilename, keepAudio: item.keepAudio, mediaTools: item.mediaTools || null, completedAt: item.completedAt || item.updatedAt || batch.finishedAt || batch.createdAt || null });
+            assets.push({ runId: batch.batchId || entry.name, relativePath: path.posix.join("items", item.videoId, String(itemRelativePath).replaceAll("\\", "/")), name: clip.namedFilename || `${clip.shotId || "片段"}.mp4`, startSec: clip.startSec, endSec: clip.endSec, usageType: clip.usageType || null, contentTitle: clip.contentTitle || null, sourceId, sourceFolderName, sourceFilename, workflow, keepAudio: item.keepAudio, mediaTools: item.mediaTools || null, completedAt: item.completedAt || item.updatedAt || batch.finishedAt || batch.createdAt || null });
           }
         }
         continue;
@@ -470,11 +502,16 @@ async function listShotAssets() {
       catch { run = JSON.parse(await readFile(path.join(runDir, "run.json"), "utf8")); }
       if (run.status !== "completed") continue;
       let clips = run.shots || [];
-      try { clips = JSON.parse(await readFile(path.join(runDir, "artifacts", "rename_manifest.json"), "utf8")); } catch {}
+      let named = false;
+      try { clips = JSON.parse(await readFile(path.join(runDir, "artifacts", "rename_manifest.json"), "utf8")); named = true; } catch {}
+      const sourceFilename = run.sourceFilename || "素材";
+      const sourceFolderName = run.sourceFolderName || path.parse(sourceFilename).name;
+      const sourceId = run.sourceFolderId || run.runId || entry.name;
+      const workflow = run.workflow || (named ? "ffmpeg_gemini_naming" : "ffmpeg_only");
       for (const clip of clips) {
         const relativePath = clip.namedPath || clip.filePath;
         if (!relativePath) continue;
-        assets.push({ runId: run.runId || entry.name, relativePath, name: clip.namedFilename || `${clip.shotId || "片段"}.mp4`, startSec: clip.startSec, endSec: clip.endSec, sourceFilename: run.sourceFilename, keepAudio: run.keepAudio, mediaTools: run.mediaTools || null, completedAt: run.completedAt || run.updatedAt || run.createdAt || null });
+        assets.push({ runId: run.runId || entry.name, relativePath, name: clip.namedFilename || `${clip.shotId || "片段"}.mp4`, startSec: clip.startSec, endSec: clip.endSec, usageType: clip.usageType || null, contentTitle: clip.contentTitle || null, sourceId, sourceFolderName, sourceFilename, workflow, keepAudio: run.keepAudio, mediaTools: run.mediaTools || null, completedAt: run.completedAt || run.updatedAt || run.createdAt || null });
       }
     } catch (error) {
       scanErrors.push({ entry: entry.name, message: error.message });
@@ -646,7 +683,8 @@ ipcMain.handle("kling-get-config", () => getKlingConfig());
 ipcMain.handle("kling-list-assets", () => listKlingAssets());
 ipcMain.handle("kling-create-run", (_event, payload) => createKlingRun(payload || {}));
 ipcMain.handle("kling-get-run", (_event, runId) => klingRequest(`api/runs/${encodeURIComponent(runId)}`));
-ipcMain.handle("kling-start-video", (_event, runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit) => startKlingVideo(runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit));
+ipcMain.handle("kling-start-video", (_event, runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit, voiceEnabled) => startKlingVideo(runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit, voiceEnabled));
+ipcMain.handle("kling-inspect-reference-audio", (_event, videoPath) => inspectReferenceAudio(videoPath));
 ipcMain.handle("kling-resume-run", (_event, runId) => resumeKlingRun(runId));
 ipcMain.handle("kling-retry-image", (_event, runId, indexes) => retryKlingImage(runId, indexes));
 ipcMain.handle("shot-get-config", () => shotRequest("api/config"));

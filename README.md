@@ -24,7 +24,7 @@
 - Node.js 20 或更高版本
 - npm
 - FFmpeg 与 FFprobe（开发运行时放入系统 `PATH`）
-- Cloudflared（仅“参考视频生成”模式需要，放入系统 `PATH`）
+- Cloudflared（“参考视频生成”或关键帧模式的声音参考需要，放入系统 `PATH`）
 
 首次克隆后安装依赖：
 
