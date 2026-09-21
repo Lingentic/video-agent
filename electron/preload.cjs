@@ -8,21 +8,24 @@ contextBridge.exposeInMainWorld("videoClient", {
   openLogs: () => ipcRenderer.invoke("open-logs"),
   getKlingConfig: () => ipcRenderer.invoke("kling-get-config"),
   listKlingAssets: () => ipcRenderer.invoke("kling-list-assets"),
-  createKlingRun: (videoFile, productFile, voiceScript, audioMode, videoMode, duration, voiceSource, voiceSampleFile) => ipcRenderer.invoke("kling-create-run", {
+  createKlingRun: (videoFile, productFile, voiceScript, audioMode, videoMode, duration, voiceId) => ipcRenderer.invoke("kling-create-run", {
     videoPath: webUtils.getPathForFile(videoFile),
     productPath: webUtils.getPathForFile(productFile),
-    voiceSamplePath: voiceSampleFile ? webUtils.getPathForFile(voiceSampleFile) : null,
     voiceScript,
     audioMode,
     videoMode,
     duration,
-    voiceSource
+    voiceId
   }),
   getKlingRun: (runId) => ipcRenderer.invoke("kling-get-run", runId),
   startKlingVideo: (runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit = false, voiceEnabled = true) => ipcRenderer.invoke("kling-start-video", runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit, voiceEnabled),
   inspectReferenceAudio: (videoFile) => ipcRenderer.invoke("kling-inspect-reference-audio", webUtils.getPathForFile(videoFile)),
   resumeKlingRun: (runId) => ipcRenderer.invoke("kling-resume-run", runId),
   retryKlingImage: (runId, indexes) => ipcRenderer.invoke("kling-retry-image", runId, indexes),
+  listVoices: () => ipcRenderer.invoke("voice-list"),
+  createVoice: (sourceFile, name) => ipcRenderer.invoke("voice-create", { sourcePath: webUtils.getPathForFile(sourceFile), name }),
+  deleteVoice: (voiceId) => ipcRenderer.invoke("voice-delete", voiceId),
+  revoiceVideo: (videoUrl, runId, voiceId, text) => ipcRenderer.invoke("voice-revoice-video", { videoUrl, runId, voiceId, text }),
   getShotConfig: () => ipcRenderer.invoke("shot-get-config"),
   listShotAssets: () => ipcRenderer.invoke("shot-list-assets"),
   createShotRun: (file, workflow, keepAudio) => ipcRenderer.invoke("shot-create-run", {

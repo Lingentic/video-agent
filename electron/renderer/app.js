@@ -17,6 +17,10 @@ const videoClient = window.videoClient || {
   getKlingRun: async () => { throw new Error("浏览器预览模式下不能查询产品替换任务"); },
   startKlingVideo: async () => { throw new Error("浏览器预览模式下不能启动视频生成"); },
   resumeKlingRun: async () => { throw new Error("浏览器预览模式下不能恢复产品替换任务"); },
+  listVoices: async () => [],
+  createVoice: async () => { throw new Error("浏览器预览模式下不能创建声音"); },
+  deleteVoice: async () => { throw new Error("浏览器预览模式下不能删除声音"); },
+  revoiceVideo: async () => { throw new Error("浏览器预览模式下不能重新配音"); },
   getShotConfig: async () => ({ apiKeyConfigured: false, uploadLimitMb: 500 }),
   listShotAssets: async () => ({ baseUrl: "", assets: [] }),
   createShotRun: async () => { throw new Error("浏览器预览模式下不能运行素材分割"); },
@@ -31,13 +35,13 @@ const videoClient = window.videoClient || {
 };
 const tools = [
   { id: "split", icon: `<svg viewBox="0 0 24 24"><path d="m8.5 8.5 10 10M8.5 15.5 18.5 5.5"/><circle cx="6" cy="7" r="2.5"/><circle cx="6" cy="17" r="2.5"/></svg>`, name: "素材分割", note: "素材清洗、分割与归档" },
-  { id: "remake", icon: `<svg viewBox="0 0 24 24"><path d="M5 8h13m0 0-3-3m3 3-3 3M19 16H6m0 0 3 3m-3-3 3-3"/></svg>`, name: "产品替换", note: "按参考视频生成同款" },
+  { id: "remake", icon: `<svg viewBox="0 0 24 24"><path d="M5 8h13m0 0-3-3m3 3-3 3M19 16H6m0 0 3 3m-3-3 3-3"/></svg>`, name: "产品替换", note: "多关键帧商品替换" },
   { id: "compose", icon: `<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="m10 9 5 3-5 3z"/></svg>`, name: "视频合成", note: "多类型素材智能成片", available: false },
   { id: "library", icon: `<svg viewBox="0 0 24 24"><path d="M3 6.5h6l2 2h10v10H3z"/></svg>`, name: "素材库", note: "统一管理创作素材" }
 ];
 const state = {
   active: "split",
-  remake: { products: [], reference: null, duration: 5, ratio: "9:16", resolution: "768P", videoMode: "multi_keyframes", audio: "voice", voiceEnabled: true, voiceScript: "", voiceSource: "video", voiceSample: null, voiceDetected: null, progress: 0, routeIndex: 0, stage: "", runId: null, serviceBaseUrl: "", editedImage: null, editedKeyframes: [], keyframeTimes: [], selectedRetryIndexes: [], imageReady: false, result: null, error: null, config: null, running: false },
+  remake: { products: [], reference: null, duration: 5, ratio: "9:16", resolution: "768P", videoMode: "multi_keyframes", audio: "voice", voiceEnabled: true, voiceScript: "", voiceDetected: null, voices: [], selectedVoiceId: null, voicePanel: null, voicePlayingId: null, revoicePending: false, voiceBusy: false, revoiceError: null, progress: 0, routeIndex: 0, stage: "", runId: null, serviceBaseUrl: "", editedImage: null, editedKeyframes: [], keyframeTimes: [], selectedRetryIndexes: [], imageReady: false, result: null, error: null, config: null, running: false },
   split: { source: null, sources: [], mode: "ffmpeg_only", keepAudio: true, progress: 0, routeIndex: 0, stage: "", runId: null, serviceBaseUrl: "", result: null, error: null, config: null, running: false, batch: null },
   audio: { source: null, script: "", progress: 0, result: null },
   compose: { script: "", ratio: "9:16", resolution: "1080P", progress: 0, result: null },
@@ -52,10 +56,31 @@ let shotAssetsLoading = false;
 let klingAssetsLoading = false;
 let latestBatchChecked = false;
 let previewOpener = null;
+let voicePreviewAudio = null;
 const esc = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
 const mediaUrl = (file) => file ? URL.createObjectURL(file) : "";
 
 function notify(message) { toast.textContent = message; toast.classList.add("show"); clearTimeout(notify.timer); notify.timer = setTimeout(() => toast.classList.remove("show"), 1800); }
+function syncVoicePlaybackUi() {
+  document.querySelectorAll('[data-action="voice-preview-play"]').forEach((button) => {
+    const playing = button.dataset.voiceId === state.remake.voicePlayingId;
+    button.textContent = playing ? "Ⅱ" : "▶";
+    button.setAttribute("aria-pressed", String(playing));
+    button.closest("article, div")?.querySelector(".voice-fingerprint")?.classList.toggle("is-playing", playing);
+  });
+}
+
+function syncVoiceLibrarySelectionUi() {
+  workspace.querySelectorAll(".voice-library-grid > article").forEach((card) => {
+    const button = card.querySelector('[data-action="voice-select"]');
+    const selected = button?.dataset.voiceId === state.remake.selectedVoiceId;
+    card.classList.toggle("is-selected", selected);
+    button?.setAttribute("aria-pressed", String(selected));
+    button?.setAttribute("aria-label", `${selected ? "已选择" : "选择"}${card.querySelector("strong")?.textContent || "音色"}`);
+    const mark = button?.querySelector("i");
+    if (mark) mark.textContent = selected ? "✓" : "";
+  });
+}
 function openMediaViewer(card) {
   const { previewUrl: url, previewKind: kind = "video", previewName: name = "未命名素材" } = card.dataset;
   if (!url) return;
@@ -388,9 +413,9 @@ async function runSplit({ resumeNaming = false } = {}) {
 
 function updateRemakeStage(stage) {
   const item = state.remake;
-  const values = { upload: 12, image: 45, video: 78, completed: 100 };
-  const labels = { upload: "上传素材并抽取关键帧", image: "逐张生成商品替换关键帧", video: "根据确认关键帧生成视频", completed: "整理最终成片" };
-  const routeIndexes = { upload: 0, image: 1, video: 2, completed: 3 };
+  const values = { upload: 12, image: 45, video: 72, voice: 88, completed: 100 };
+  const labels = { upload: "上传素材并抽取关键帧", image: "逐张生成商品替换关键帧", video: "根据确认关键帧生成视频", voice: "生成克隆配音并校准时长", completed: "整理最终成片" };
+  const routeIndexes = { upload: 0, image: 1, video: 2, voice: 3, completed: 3 };
   item.progress = values[stage] || item.progress || 5;
   if (Number.isInteger(routeIndexes[stage])) item.routeIndex = routeIndexes[stage];
   item.stage = labels[stage] || stage || "准备任务";
@@ -418,12 +443,62 @@ async function pollKlingRun() {
   throw new Error("产品替换任务已中断");
 }
 
+async function completeRemakeResult(response) {
+  const item = state.remake;
+  const originalUrl = new URL(response.output.url, response.baseUrl || item.serviceBaseUrl).toString();
+  const remoteKey = `${response.id}:${response.output.id}`;
+  let result = { name: response.output.name || "商品替换成片.mp4", url: originalUrl, remoteKey, runId: response.id, sourceId: response.id, sourceFilename: item.reference?.name || "商品替换", sourceFolderName: String(item.reference?.name || "商品替换").replace(/\.[^.]+$/, ""), workflow: "remake", duration: item.duration, voiceName: "原视频声音", completedAt: response.updatedAt || new Date().toISOString() };
+  item.revoiceError = null;
+  if (item.voiceEnabled && item.selectedVoiceId) {
+    updateRemakeStage("voice");
+    item.stage = "生成克隆配音并校准时长";
+    if (state.active === "remake") render({ preserveControls: true });
+    try {
+      result = { ...result, ...(await videoClient.revoiceVideo(originalUrl, response.id, item.selectedVoiceId, item.voiceScript)), remoteKey };
+    } catch (error) {
+      item.revoiceError = error.message;
+      result.voiceName = "原视频声音（克隆配音失败）";
+    }
+  }
+  item.result = result;
+  updateRemakeStage("completed");
+  const existingIndex = state.library.findIndex((asset) => asset.remoteKey === remoteKey);
+  const libraryAsset = { ...result, kind: "video", origin: "产品替换" };
+  if (existingIndex >= 0) state.library.splice(existingIndex, 1, libraryAsset);
+  else state.library.unshift(libraryAsset);
+  sortLibraryNewestFirst();
+}
+
+async function revoiceCurrentResult() {
+  const item = state.remake;
+  if (!item.result || !item.selectedVoiceId || !item.voiceScript.trim() || item.running) return;
+  item.running = true;
+  item.revoiceError = null;
+  item.stage = "生成克隆配音并校准时长";
+  updateRemakeStage("voice");
+  render();
+  try {
+    const updated = await videoClient.revoiceVideo(item.result.url, item.runId || item.result.runId, item.selectedVoiceId, item.voiceScript);
+    item.result = { ...item.result, ...updated };
+    const index = state.library.findIndex((asset) => asset.remoteKey === item.result.remoteKey);
+    if (index >= 0) state.library.splice(index, 1, { ...item.result, kind: "video", origin: "产品替换" });
+    notify("新声音已生成并替换到成片中");
+  } catch (error) {
+    item.revoiceError = error.message;
+    notify(`重新配音失败：${error.message}`);
+  } finally {
+    item.running = false;
+    item.progress = 0;
+    if (state.active === "remake") render();
+  }
+}
+
 async function runRemake({ retryVideo = false } = {}) {
   const item = state.remake;
   const referenceVideoMode = item.videoMode === "reference_video";
   const outputAudioEnabled = referenceVideoMode ? item.audio === "voice" : item.voiceEnabled;
-  const voiceReferenceReady = item.voiceSource === "upload" ? Boolean(item.voiceSample) : item.voiceDetected?.hasAudio === true;
-  const voiceSettingsValid = !item.voiceEnabled || (Boolean(item.voiceScript.trim()) && item.voiceScript.length <= item.duration * 6 && voiceReferenceReady);
+  const selectedVoice = item.voices.find((voice) => voice.id === item.selectedVoiceId);
+  const voiceSettingsValid = !item.voiceEnabled || (Boolean(item.voiceScript.trim()) && item.voiceScript.length <= item.duration * 6 && Boolean(selectedVoice) && selectedVoice.demo !== true);
   if (item.running || !item.reference || !item.products.length || (!referenceVideoMode && !voiceSettingsValid)) return;
   item.running = true;
   item.result = null;
@@ -440,7 +515,7 @@ async function runRemake({ retryVideo = false } = {}) {
       item.runId = null;
       updateRemakeStage("upload");
       render();
-      response = await videoClient.createKlingRun(item.reference.file, item.products[0].file, item.voiceEnabled && !referenceVideoMode ? item.voiceScript : "", outputAudioEnabled ? "voice" : "silent", item.videoMode, item.duration, item.voiceSource, item.voiceSample?.file || null);
+      response = await videoClient.createKlingRun(item.reference.file, item.products[0].file, item.voiceEnabled && !referenceVideoMode ? item.voiceScript : "", outputAudioEnabled ? "voice" : "silent", item.videoMode, item.duration, item.selectedVoiceId);
       item.runId = response.id;
       item.serviceBaseUrl = response.baseUrl;
     }
@@ -459,11 +534,7 @@ async function runRemake({ retryVideo = false } = {}) {
       return;
     }
     updateRemakeStage("completed");
-    const url = new URL(response.output.url, response.baseUrl || item.serviceBaseUrl).toString();
-    const remoteKey = `${response.id}:${response.output.id}`;
-    item.result = { name: response.output.name || "商品替换成片.mp4", url, remoteKey, runId: response.id, completedAt: response.updatedAt || new Date().toISOString() };
-    if (!state.library.some((asset) => asset.remoteKey === remoteKey)) state.library.unshift({ ...item.result, kind: "video", origin: "产品替换" });
-    sortLibraryNewestFirst();
+    await completeRemakeResult(response);
     notify("产品替换已完成");
   } catch (error) {
     const rawStage = error.stage || item.stage || "产品替换";
@@ -501,11 +572,7 @@ async function recoverRemake() {
       notify("已恢复原任务的关键帧结果，未重新提交");
       return;
     }
-    const url = new URL(response.output.url, response.baseUrl || item.serviceBaseUrl).toString();
-    const remoteKey = `${response.id}:${response.output.id}`;
-    item.result = { name: response.output.name || "商品替换成片.mp4", url, remoteKey, runId: response.id, completedAt: response.updatedAt || new Date().toISOString() };
-    if (!state.library.some((asset) => asset.remoteKey === remoteKey)) state.library.unshift({ ...item.result, kind: "video", origin: "产品替换" });
-    sortLibraryNewestFirst();
+    await completeRemakeResult(response);
     notify("已恢复原任务结果，未重新提交");
   } catch (error) {
     const rawStage = error.stage || item.stage || "产品替换";
@@ -519,8 +586,8 @@ async function recoverRemake() {
 
 async function confirmRemakeImage() {
   const item = state.remake;
-  const voiceReferenceReady = item.voiceSource === "upload" ? Boolean(item.voiceSample) : item.voiceDetected?.hasAudio === true;
-  const voiceSettingsValid = !item.voiceEnabled || (Boolean(item.voiceScript.trim()) && item.voiceScript.length <= item.duration * 6 && voiceReferenceReady);
+  const selectedVoice = item.voices.find((voice) => voice.id === item.selectedVoiceId);
+  const voiceSettingsValid = !item.voiceEnabled || (Boolean(item.voiceScript.trim()) && item.voiceScript.length <= item.duration * 6 && Boolean(selectedVoice) && selectedVoice.demo !== true);
   if (!item.runId || !item.imageReady || !item.editedKeyframes.length || item.running || !voiceSettingsValid) return;
   item.running = true;
   item.imageReady = false;
@@ -531,11 +598,7 @@ async function confirmRemakeImage() {
     await videoClient.startKlingVideo(item.runId, item.voiceEnabled ? item.voiceScript : "", item.videoMode, item.duration, item.keyframeTimes, false, item.voiceEnabled);
     const response = await pollKlingRun();
     updateRemakeStage("completed");
-    const url = new URL(response.output.url, response.baseUrl || item.serviceBaseUrl).toString();
-    const remoteKey = `${response.id}:${response.output.id}`;
-    item.result = { name: response.output.name || "商品替换成片.mp4", url, remoteKey, runId: response.id, completedAt: response.updatedAt || new Date().toISOString() };
-    if (!state.library.some((asset) => asset.remoteKey === remoteKey)) state.library.unshift({ ...item.result, kind: "video", origin: "产品替换" });
-    sortLibraryNewestFirst();
+    await completeRemakeResult(response);
     notify("产品替换已完成");
   } catch (error) {
     item.error = { stage: error.stage || "video", rawStage: error.stage || "video", message: error.message };
@@ -564,41 +627,128 @@ async function retryRemakeImages(indexes = [0]) {
   finally { item.running = false; item.progress = 0; if (state.active === "remake") render(); }
 }
 
+function voiceFingerprint(seed = 1) {
+  const bars = Array.from({ length: 11 }, (_, index) => 7 + ((index * 13 + seed * 7) % 23));
+  return `<span class="voice-fingerprint" aria-hidden="true">${bars.map((height) => `<i style="height:${height}px"></i>`).join("")}</span>`;
+}
+
+function voiceChangeIcon() {
+  return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h13"/><path d="m14 5 3 3-3 3"/><path d="M20 16H7"/><path d="m10 13-3 3 3 3"/></svg>`;
+}
+
+function remakeVoiceChoiceMarkup(item, voiceLocked = item.running) {
+  const selectedVoice = item.voices.find((voice) => voice.id === item.selectedVoiceId) || null;
+  return selectedVoice
+    ? `<article class="selected-voice-card ${selectedVoice.demo ? "is-demo" : ""}"><button class="voice-play" data-action="voice-preview-play" data-voice-id="${esc(selectedVoice.id)}" type="button">${item.voicePlayingId === selectedVoice.id ? "Ⅱ" : "▶"}</button>${voiceFingerprint(3)}<span><strong>${esc(selectedVoice.name)}</strong></span><button class="voice-change" data-action="voice-open-picker" type="button" aria-label="更换音色" title="更换音色" ${voiceLocked ? "disabled" : ""}>${voiceChangeIcon()}</button></article>`
+    : `<div class="voice-empty-choice"><button data-action="voice-open-create" type="button" ${item.reference && item.voiceDetected?.hasAudio && !voiceLocked ? "" : "disabled"}><i>＋</i><span><strong>从视频创建</strong><small>${item.reference ? item.voiceDetected?.checking ? "正在检测人声" : item.voiceDetected?.hasAudio ? "提取当前视频人声" : "当前视频没有可用人声" : "请先上传参考视频"}</small></span></button><button data-action="voice-open-picker" type="button" ${(item.voices.length && !voiceLocked) ? "" : "disabled"}><i>⌁</i><span><strong>选择已有声音</strong><small>${item.voices.length ? `已有 ${item.voices.length} 个声音` : "暂无已保存声音"}</small></span></button></div>`;
+}
+
+function syncRemakeVoiceChoice() {
+  const current = workspace.querySelector(".voice-control-stack > :first-child");
+  if (!current) return;
+  current.insertAdjacentHTML("beforebegin", remakeVoiceChoiceMarkup(state.remake));
+  current.remove();
+  syncRemakeSubmitUi();
+}
+
+function syncRemakeSubmitUi() {
+  const item = state.remake;
+  const voiceLimit = item.duration * 6;
+  const selectedVoice = item.voices.find((voice) => voice.id === item.selectedVoiceId);
+  const voiceValid = !item.voiceEnabled || (Boolean(selectedVoice) && selectedVoice.demo !== true && Boolean(item.voiceScript.trim()) && item.voiceScript.length <= voiceLimit);
+  const ready = item.videoMode === "reference_video" ? item.config?.klingConfigured === true : item.config?.configured === true;
+  const generateButton = workspace.querySelector('[data-action="remake-generate"]');
+  if (generateButton) generateButton.disabled = !ready || item.running || item.imageReady || !item.products.length || !item.reference || (item.videoMode !== "reference_video" && !voiceValid);
+  const confirmButton = workspace.querySelector('[data-action="confirm-remake-image"]');
+  if (confirmButton) {
+    confirmButton.disabled = !voiceValid;
+    confirmButton.textContent = `确认并生成 ${item.duration} 秒视频`;
+  }
+  const note = workspace.querySelector(".control-panel .submit small");
+  if (!note) return;
+  if (!ready) note.textContent = `${item.videoMode === "reference_video" ? "Kling" : "商品替换"}服务未配置`;
+  else if (!item.products.length || !item.reference) note.textContent = "请先上传产品图与参考视频";
+  else if (item.videoMode !== "reference_video" && item.voiceEnabled && (!selectedVoice || selectedVoice.demo)) note.textContent = selectedVoice?.demo ? "演示音色仅用于查看选择和删除逻辑" : "请选择或创建声音";
+  else if (item.videoMode !== "reference_video" && item.voiceEnabled && item.voiceScript.length > voiceLimit) note.textContent = `当前台词超过 ${item.duration} 秒建议上限，请缩短至 ${voiceLimit} 字以内`;
+  else {
+    const voice = selectedVoice;
+    note.textContent = `${item.videoMode === "reference_video" ? "直接生成替换视频" : "确认全部替换关键帧后再生成视频"} · ${item.duration} 秒 · ${item.videoMode === "reference_video" ? "跟随原视频 · 720P" : "9:16 · 768P"} · ${item.videoMode === "reference_video" ? item.audio === "voice" ? "保留原视频音轨" : "输出无声" : !item.voiceEnabled ? "不生成声音与口型" : `使用「${voice?.name || "已选声音"}」生成配音`}`;
+  }
+}
+
+function applyRemakeDurationLocally(value, option) {
+  const item = state.remake;
+  if (item.duration === value) return;
+  item.duration = value;
+  option.parentElement?.querySelectorAll('[data-option="remakeDuration"]').forEach((button) => button.classList.toggle("active", button === option));
+  const referenceStep = workspace.querySelector("#referenceInput")?.closest(".step");
+  if (item.videoMode !== "reference_video") {
+    const note = referenceStep?.querySelector("header small");
+    if (note) note.textContent = `建议与 ${value} 秒输出时长一致`;
+    const uploadNote = referenceStep?.querySelector(".upload-box small");
+    if (uploadNote) uploadNote.textContent = `MP4 / MOV · 建议 ${value} 秒`;
+  }
+  const textarea = workspace.querySelector("#remakeVoiceScript");
+  if (textarea) {
+    const limit = value * 6;
+    textarea.maxLength = limit;
+    textarea.placeholder = `输入约 ${value} 秒的台词，建议不超过 ${limit} 字`;
+    const counter = textarea.closest(".voice-script")?.querySelector("label small");
+    if (counter) counter.innerHTML = `<b>${item.voiceScript.length}</b> / ${limit} 字`;
+    textarea.closest(".voice-script")?.classList.toggle("is-over-limit", item.voiceScript.length > limit);
+  }
+  syncRemakeSubmitUi();
+}
+
+function replaceVoiceOverlay(panel) {
+  state.remake.voicePanel = panel;
+  workspace.querySelector(".voice-overlay")?.remove();
+  if (panel) workspace.insertAdjacentHTML("beforeend", renderVoiceOverlay(state.remake));
+}
+
+function showVoiceDeleteConfirm(voice) {
+  workspace.querySelector(".voice-delete-confirm-layer")?.remove();
+  const trashIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V4h6v3M8 10v7M12 10v7M16 10v7M7 7l1 13h8l1-13"/></svg>`;
+  workspace.querySelector(".voice-overlay")?.insertAdjacentHTML("beforeend", `<div class="voice-delete-confirm-layer" data-action="voice-delete-cancel"><section class="voice-delete-confirm" role="alertdialog" aria-modal="true" aria-labelledby="voiceDeleteTitle"><i>${trashIcon}</i><h3 id="voiceDeleteTitle">删除这个音色？</h3><p>删除后将无法继续使用“${esc(voice.name)}”。</p><div><button data-action="voice-delete-cancel" type="button">取消</button><button class="is-danger" data-action="voice-delete-confirm" data-voice-id="${esc(voice.id)}" type="button">删除音色</button></div></section></div>`);
+}
+
+function renderVoiceOverlay(item) {
+  if (item.voicePanel === "picker") {
+    const voices = item.voices || [];
+    const createIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m9.5 9 5 3-5 3z"/><path d="M17 2.5v5M14.5 5h5"/></svg>`;
+    const removeVoiceIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M7.10002 5H3C2.44772 5 2 5.44772 2 6C2 6.55228 2.44772 7 3 7H4.06055L4.88474 20.1871C4.98356 21.7682 6.29471 23 7.8789 23H16.1211C17.7053 23 19.0164 21.7682 19.1153 20.1871L19.9395 7H21C21.5523 7 22 6.55228 22 6C22 5.44772 21.5523 5 21 5H19.0073C19.0018 4.99995 18.9963 4.99995 18.9908 5H16.9C16.4367 2.71776 14.419 1 12 1C9.58104 1 7.56329 2.71776 7.10002 5ZM9.17071 5H14.8293C14.4175 3.83481 13.3062 3 12 3C10.6938 3 9.58254 3.83481 9.17071 5ZM17.9355 7H6.06445L6.88085 20.0624C6.91379 20.5894 7.35084 21 7.8789 21H16.1211C16.6492 21 17.0862 20.5894 17.1192 20.0624L17.9355 7ZM14.279 10.0097C14.83 10.0483 15.2454 10.5261 15.2068 11.0771L14.7883 17.0624C14.7498 17.6134 14.2719 18.0288 13.721 17.9903C13.17 17.9517 12.7546 17.4739 12.7932 16.9229L13.2117 10.9376C13.2502 10.3866 13.7281 9.97122 14.279 10.0097ZM9.721 10.0098C10.2719 9.97125 10.7498 10.3866 10.7883 10.9376L11.2069 16.923C11.2454 17.4739 10.83 17.9518 10.2791 17.9903C9.72811 18.0288 9.25026 17.6134 9.21173 17.0625L8.79319 11.0771C8.75467 10.5262 9.17006 10.0483 9.721 10.0098Z"/></svg>`;
+    return `<div class="voice-overlay" data-action="voice-close-panel"><section class="voice-dialog" role="dialog" aria-modal="true" aria-label="选择音色"><header><span><small>声音库</small><h2>选择一个音色</h2></span><button data-action="voice-close-panel" type="button" aria-label="关闭">×</button></header><div class="voice-library-grid">${voices.map((voice, index) => { const selected = voice.id === item.selectedVoiceId; return `<article class="${selected ? "is-selected" : ""} ${voice.demo ? "is-demo" : ""}"><button class="voice-library-play" data-action="voice-preview-play" data-voice-id="${esc(voice.id)}" type="button" aria-label="试听${esc(voice.name)}">${item.voicePlayingId === voice.id ? "Ⅱ" : "▶"}</button>${voiceFingerprint(index + 2)}<span><strong>${esc(voice.name)}</strong><small>${voice.demo ? "演示音色" : voice.duration ? `${Number(voice.duration).toFixed(1)} 秒样本` : "已保存音色"}</small></span><button class="voice-library-select" data-action="voice-select" data-voice-id="${esc(voice.id)}" type="button" aria-label="${selected ? "已选择" : "选择"}${esc(voice.name)}" aria-pressed="${selected}"><i aria-hidden="true">${selected ? "✓" : ""}</i></button><div class="voice-library-delete-slot"><button class="voice-library-delete" data-action="voice-delete" data-voice-id="${esc(voice.id)}" type="button" aria-label="删除${esc(voice.name)}">${removeVoiceIcon}</button></div></article>`; }).join("")}${item.reference ? `<button class="voice-create-tile" data-action="voice-open-create" type="button"><i>${createIcon}</i><strong>根据视频创建新音色</strong></button>` : ""}${voices.length || item.reference ? "" : `<div class="voice-library-empty"><strong>还没有可用音色</strong><small>请先上传参考视频，再从视频中创建音色。</small></div>`}</div></section></div>`;
+  }
+  if (item.voicePanel === "create") {
+    const duration = item.voiceDetected?.duration;
+    return `<div class="voice-overlay" data-action="voice-close-panel"><section class="voice-dialog voice-create-dialog" role="dialog" aria-modal="true" aria-label="创建声音"><header><span><small>创建声音</small><h2>从当前视频提取</h2></span><button data-action="voice-close-panel" type="button" aria-label="关闭">×</button></header><div class="voice-source-audit"><div class="voice-source-audit__preview"><i>▶</i><span><strong>${esc(item.reference?.name || "参考视频中的人声")}</strong><small>${duration ? `将提取前 ${Math.min(30, Number(duration)).toFixed(1)} 秒清晰人声` : "将自动提取清晰人声"}</small></span></div><ul><li><i>✓</i>自动转换为单声道</li><li><i>✓</i>自动规整采样率</li><li><i>✓</i>自动进行降噪预处理</li></ul></div><label class="voice-name-field"><span>声音名称</span><input id="voiceNameInput" value="新建声音" maxlength="20" ${item.voiceBusy ? "disabled" : ""}></label><div class="voice-create-actions"><button data-action="voice-close-panel" type="button" ${item.voiceBusy ? "disabled" : ""}>取消</button><button class="primary" data-action="voice-create" type="button" ${item.voiceBusy ? "disabled" : ""}>${item.voiceBusy ? "正在创建…" : "创建声音"}</button></div></section></div>`;
+  }
+  return "";
+}
+
 function renderRemake() {
   const item = state.remake;
   const referenceVideoMode = item.videoMode === "reference_video";
   const videoResolution = referenceVideoMode ? "720P" : "768P";
   const videoRatio = referenceVideoMode ? "跟随原视频" : "9:16";
   const referenceVideoReady = item.config?.referenceVideoConfigured !== false;
-  const lockedVideoModes = item.running ? ["关键帧生成", "参考视频生成"] : [];
-  const videoModeOptions = options("remakeVideoMode", ["关键帧生成", "参考视频生成"], referenceVideoMode ? "参考视频生成" : "关键帧生成", lockedVideoModes);
   const durationLabel = `${item.duration} 秒`;
   const durationValues = referenceVideoMode ? ["5 秒", "10 秒", "15 秒"] : ["5 秒", "8 秒", "10 秒", "15 秒"];
-  const durationOptions = options("remakeDuration", durationValues, durationLabel, item.running ? durationValues : []);
+  const durationOptions = options("remakeDuration", durationValues, durationLabel, item.running || item.imageReady ? durationValues : []);
   const voiceLimit = item.duration * 6;
   const voiceWithinLimit = item.voiceScript.length <= voiceLimit;
   const voiceEnabled = item.voiceEnabled !== false;
-  const voiceLocked = item.running || item.imageReady;
+  const voiceLocked = item.running;
   const soundOptions = options("audio", ["无声音", "有声音"], item.audio === "voice" ? "有声音" : "无声音");
-  const voiceSourceOptions = options("remakeVoiceSource", ["自动提取", "上传样本"], item.voiceSource === "upload" ? "上传样本" : "自动提取", voiceLocked ? ["自动提取", "上传样本"] : []);
-  const voiceReferenceReady = referenceVideoMode || !voiceEnabled || (item.voiceSource === "upload" ? Boolean(item.voiceSample) : item.voiceDetected?.hasAudio === true);
-  const automaticVoice = !item.reference
-    ? `<div class="voice-reference-card"><i><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h2l2-6 3 12 3-8 2 4h4"/></svg></i><span><strong>等待参考视频</strong><small>上传后将自动检测人声</small></span></div>`
-    : item.voiceDetected?.checking
-      ? `<div class="voice-reference-card"><i><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h2l2-6 3 12 3-8 2 4h4"/></svg></i><span><strong>正在检测参考视频声音</strong><small>只读取媒体信息，不会提交生成任务</small></span></div>`
-      : item.voiceDetected?.hasAudio === true
-        ? `<div class="voice-reference-card is-ready"><i><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h2l2-6 3 12 3-8 2 4h4"/></svg></i><span><strong>参考视频声音可用</strong><small>${esc(item.voiceDetected.detail || "生成前自动提取声音样本")}</small></span><em>已就绪</em></div>`
-        : `<div class="voice-reference-card is-error"><i>!</i><span><strong>没有检测到可用音轨</strong><small>请改用上传样本，或关闭声音与口型</small></span></div>`;
-  const uploadedVoice = item.voiceSample
-    ? `<div class="voice-reference-card is-ready"><i><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0-4-4m4 4 4-4M5 19h14"/></svg></i><span><strong>${esc(item.voiceSample.name)}</strong><small>${esc(item.voiceSample.meta || "声音样本已就绪")}</small></span><em>已就绪</em></div><label class="inline-action" for="voiceSampleInput">更换样本</label><input id="voiceSampleInput" type="file" accept="audio/*,.mp3,.wav,.m4a" ${voiceLocked ? "disabled" : ""} hidden>`
-    : `<label class="voice-sample-upload" for="voiceSampleInput"><i>＋</i><span><strong>上传声音样本</strong><small>MP3 / WAV / M4A · 建议单人清晰语音</small></span><input id="voiceSampleInput" type="file" accept="audio/*,.mp3,.wav,.m4a" ${voiceLocked ? "disabled" : ""} hidden></label>`;
-  const voiceInput = referenceVideoMode ? "" : `<div class="voice-control-stack"><div class="voice-setting-group"><small>口型音色</small>${voiceSourceOptions}</div>${item.voiceSource === "upload" ? uploadedVoice : automaticVoice}<div class="voice-script ${voiceWithinLimit ? "" : "is-over-limit"}"><label for="remakeVoiceScript"><strong>台词</strong><small><b>${item.voiceScript.length}</b> / ${voiceLimit} 字</small></label><textarea id="remakeVoiceScript" maxlength="${voiceLimit}" placeholder="输入约 ${item.duration} 秒的台词，建议不超过 ${voiceLimit} 字">${esc(item.voiceScript)}</textarea></div></div>`;
-  const voiceSettingsValid = !voiceEnabled || (Boolean(item.voiceScript.trim()) && voiceWithinLimit && voiceReferenceReady);
+  const selectedVoice = item.voices.find((voice) => voice.id === item.selectedVoiceId) || null;
+  const voiceChoice = remakeVoiceChoiceMarkup(item, voiceLocked);
+  const voiceInput = referenceVideoMode ? "" : `<div class="voice-control-stack">${voiceChoice}<div class="voice-script ${voiceWithinLimit ? "" : "is-over-limit"}"><label for="remakeVoiceScript"><strong>台词</strong><small><b>${item.voiceScript.length}</b> / ${voiceLimit} 字</small></label><textarea id="remakeVoiceScript" maxlength="${voiceLimit}" placeholder="输入约 ${item.duration} 秒的台词，建议不超过 ${voiceLimit} 字" ${voiceLocked ? "disabled" : ""}>${esc(item.voiceScript)}</textarea></div></div>`;
+  const voiceSettingsValid = !voiceEnabled || (Boolean(item.voiceScript.trim()) && voiceWithinLimit && Boolean(selectedVoice) && selectedVoice.demo !== true);
   const voiceStep = referenceVideoMode
-    ? step(5, "声音", "", soundOptions)
-    : `<section class="step voice-step ${voiceEnabled ? "is-enabled" : "is-disabled"}"><header><b>5</b><span><strong>声音与口型</strong></span><button class="voice-toggle ${voiceEnabled ? "is-on" : ""}" data-action="toggle-remake-voice" type="button" role="switch" aria-checked="${voiceEnabled}" aria-label="${voiceEnabled ? "关闭声音与口型" : "开启声音与口型"}" ${voiceLocked ? "disabled" : ""}><i aria-hidden="true"></i></button></header><div class="voice-step__reveal" aria-hidden="${!voiceEnabled}"><div class="voice-step__reveal-inner">${voiceInput}</div></div></section>`;
+    ? step(4, "声音", "", soundOptions)
+    : `<section class="step voice-step ${voiceEnabled ? "is-enabled" : "is-disabled"}"><header><b>4</b><span><strong>声音与口型</strong></span><button class="voice-toggle ${voiceEnabled ? "is-on" : ""}" data-action="toggle-remake-voice" type="button" role="switch" aria-checked="${voiceEnabled}" aria-label="${voiceEnabled ? "关闭声音与口型" : "开启声音与口型"}" ${voiceLocked ? "disabled" : ""}><i aria-hidden="true"></i></button></header><div class="voice-step__reveal" aria-hidden="${!voiceEnabled}"><div class="voice-step__reveal-inner">${voiceInput}</div></div></section>`;
   const ready = referenceVideoMode ? item.config?.klingConfigured === true : item.config?.configured === true;
-  const controls = `<header class="panel-heading"><h2>替换视频中的商品</h2>${referenceVideoMode ? "" : "<p>自动抽取并替换多张关键帧，确认后再生成视频。</p>"}</header><div class="panel-scroll">${step(1, "产品图", "单张产品图", item.products.length ? `<div class="image-grid single"><img src="${esc(item.products[0].url)}" alt="${esc(item.products[0].name)}"></div><label class="inline-action" for="productInput">重新选择</label><input id="productInput" type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" hidden>` : uploadBox("productInput", "上传产品图", "JPG / PNG / WEBP · 单张图片", "image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"))}${step(2, "参考视频", referenceVideoMode ? "输入视频需为 3–10 秒" : `建议与 ${item.duration} 秒输出时长一致`, item.reference ? `${mediaPreview(item.reference)}<label class="inline-action" for="referenceInput">替换视频</label><input id="referenceInput" type="file" accept="video/mp4,video/quicktime,.mp4,.mov" hidden>` : uploadBox("referenceInput", "上传参考视频", referenceVideoMode ? "MP4 / MOV · 3–10 秒" : `MP4 / MOV · 建议 ${item.duration} 秒`, "video/mp4,video/quicktime,.mp4,.mov"))}${step(3, "生成方式", referenceVideoMode ? referenceVideoReady ? "Kling 直接参考原视频的动作与镜头" : "首次生成时将自动连接临时公网通道" : "抽取 4–6 张关键帧并逐张替换", videoModeOptions)}${step(4, "输出规格", "", `<div class="duration-choice"><small>视频时长</small>${durationOptions}</div><div class="fixed-specs fixed-specs--two"><span><small>视频比例</small><strong>${videoRatio}</strong></span><span><small>分辨率</small><strong>${videoResolution}</strong></span></div>`)}${voiceStep}</div><footer class="submit"><button class="primary" data-action="remake-generate" ${!ready || item.running || item.imageReady || !item.products.length || !item.reference || (!referenceVideoMode && !voiceSettingsValid) ? "disabled" : ""}>${item.running ? "正在生成…" : referenceVideoMode ? "直接生成替换视频 →" : "生成替换关键帧 →"}</button><small>${!ready ? `${referenceVideoMode ? "Kling" : "商品替换"}服务未配置` : !referenceVideoMode && voiceEnabled && !voiceReferenceReady ? "请准备口型参考声音" : !referenceVideoMode && voiceEnabled && !voiceWithinLimit ? `当前台词超过 ${item.duration} 秒建议上限，请缩短至 ${voiceLimit} 字以内` : item.products.length && item.reference ? `${referenceVideoMode ? referenceVideoReady ? "Kling 3.0 Omni 参考原视频和商品图" : "生成前会先连接 Cloudflare 临时通道" : "确认全部替换关键帧后再生成视频"} · ${item.duration} 秒 · ${videoRatio} · ${videoResolution} · ${referenceVideoMode ? item.audio === "voice" ? "保留原视频音轨" : "输出无声" : !voiceEnabled ? "不生成声音与口型" : "使用参考音色生成口型与声音"}` : "请先上传产品图与参考视频"}</small></footer>`;
+  const controls = `<header class="panel-heading"><h2>替换视频中的商品</h2>${referenceVideoMode ? "" : "<p>自动抽取并替换多张关键帧，确认后再生成视频。</p>"}</header><div class="panel-scroll">${step(1, "产品图", "单张产品图", item.products.length ? `<div class="image-grid single"><img src="${esc(item.products[0].url)}" alt="${esc(item.products[0].name)}"></div><label class="inline-action" for="productInput">重新选择</label><input id="productInput" type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" hidden>` : uploadBox("productInput", "上传产品图", "JPG / PNG / WEBP · 单张图片", "image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"))}${step(2, "参考视频", referenceVideoMode ? "输入视频需为 3–10 秒" : `建议与 ${item.duration} 秒输出时长一致`, item.reference ? `${mediaPreview(item.reference)}<label class="inline-action" for="referenceInput">替换视频</label><input id="referenceInput" type="file" accept="video/mp4,video/quicktime,.mp4,.mov" hidden>` : uploadBox("referenceInput", "上传参考视频", referenceVideoMode ? "MP4 / MOV · 3–10 秒" : `MP4 / MOV · 建议 ${item.duration} 秒`, "video/mp4,video/quicktime,.mp4,.mov"))}${step(3, "输出规格", "", `<div class="duration-choice"><small>视频时长</small>${durationOptions}</div><div class="fixed-specs fixed-specs--two"><span><small>视频比例</small><strong>${videoRatio}</strong></span><span><small>分辨率</small><strong>${videoResolution}</strong></span></div>`)}${voiceStep}</div><footer class="submit"><button class="primary" data-action="remake-generate" ${!ready || item.running || item.imageReady || !item.products.length || !item.reference || (!referenceVideoMode && !voiceSettingsValid) ? "disabled" : ""}>${item.running ? "正在生成…" : referenceVideoMode ? "直接生成替换视频 →" : "生成替换关键帧 →"}</button><small>${!ready ? `${referenceVideoMode ? "Kling" : "商品替换"}服务未配置` : !referenceVideoMode && voiceEnabled && (!selectedVoice || selectedVoice.demo) ? selectedVoice?.demo ? "演示音色仅用于查看选择和删除逻辑" : "请选择或创建声音" : !referenceVideoMode && voiceEnabled && !voiceWithinLimit ? `当前台词超过 ${item.duration} 秒建议上限，请缩短至 ${voiceLimit} 字以内` : item.products.length && item.reference ? `${referenceVideoMode ? referenceVideoReady ? "Kling 3.0 Omni 参考原视频和商品图" : "生成前会先连接 Cloudflare 临时通道" : "确认全部替换关键帧后再生成视频"} · ${item.duration} 秒 · ${videoRatio} · ${videoResolution} · ${referenceVideoMode ? item.audio === "voice" ? "保留原视频音轨" : "输出无声" : !voiceEnabled ? "不生成声音与口型" : `使用「${esc(selectedVoice?.name || "") }」生成配音`}` : "请先上传产品图与参考视频"}</small></footer>`;
   let output = referenceVideoMode
     ? `<header class="output-heading"><h2>参考视频 + 商品图 = 替换成片</h2></header><div class="equation"><span>参考视频</span><b>＋</b><span>商品图片</span><b>→</b><span class="accent">替换成片</span></div><div class="empty"><i>替</i><h3>准备产品图、参考视频和台词</h3><p>此模式直接生成成片，不经过关键帧确认。</p></div>`
     : `<header class="output-heading"><h2>多张替换关键帧生成成片</h2></header><div class="equation"><span>4–6 张关键帧</span><b>＋</b><span>商品图片</span><b>→</b><span class="accent">替换成片</span></div><div class="empty"><i>替</i><h3>准备产品图、参考视频和台词</h3><p>关键帧全部生成后会等待确认，再进入视频生成阶段。</p></div>`;
@@ -608,13 +758,23 @@ function renderRemake() {
     const safetyNote = item.runId ? "检查操作只查询原任务，不会重新提交，也不会新增计费。" : "未取得可恢复的任务编号；已停止自动重试，避免产生重复计费。";
     output = `<header class="output-heading"><h2>产品替换</h2></header><div class="failure-state"><i>!</i><small>生成失败 · ${esc(item.error.stage || "生成替换视频")}</small><h2>未能生成替换视频</h2><p>${esc(item.error.message || "服务处理失败。")}</p><p>${safetyNote}</p><div class="confirm-actions">${safeRetry}${paidRetry}</div></div>`;
   }
-  if (item.running) output = progressOutput(item.progress, referenceVideoMode ? ["上传素材", "读取参考内容", "生成替换视频", "整理最终成片"] : ["抽取关键帧", "逐张替换商品", "生成替换视频", "整理最终成片"], item.stage, "task-processing", item);
+  if (item.running) output = progressOutput(item.progress, referenceVideoMode ? ["上传素材", "读取参考内容", "生成替换视频", "整理最终成片"] : ["抽取关键帧", "逐张替换商品", "生成替换视频", item.voiceEnabled ? "生成克隆配音" : "整理最终成片"], item.stage, "task-processing", item);
   if (item.imageReady && item.editedKeyframes.length) {
     const selectedRetryIndexes = item.selectedRetryIndexes || [];
     output = `<header class="output-heading"><h2>请逐张确认商品替换是否正确</h2></header><div class="keyframe-review-grid">${item.editedKeyframes.map((frame, index) => { const selected = selectedRetryIndexes.includes(index); return `<article class="${selected ? "is-selected" : ""}"><img src="${esc(new URL(frame.url, item.serviceBaseUrl).toString())}" alt="替换关键帧 ${index + 1}"><span><strong>关键帧 ${index + 1}</strong><small>约 ${Number(item.keyframeTimes[index] || 0).toFixed(1)} 秒</small></span><button class="keyframe-select" data-action="toggle-remake-image" data-keyframe-index="${index}" type="button" aria-pressed="${selected}"><i aria-hidden="true">${selected ? "✓" : ""}</i>${selected ? "已选择" : "选择重做"}</button></article>`; }).join("")}</div><div class="confirm-actions"><button class="icon-button" data-action="retry-selected-remake-images" type="button" ${selectedRetryIndexes.length ? "" : "disabled"}>重新生成所选${selectedRetryIndexes.length ? `（${selectedRetryIndexes.length}）` : ""}</button><button class="primary" data-action="confirm-remake-image" type="button" ${voiceSettingsValid ? "" : "disabled"}>确认并生成 ${item.duration} 秒视频</button></div>`;
   }
-  if (item.result) output = `<header class="output-heading"><h2>产品替换已完成</h2></header><div class="result-video remake-final-video"><video src="${esc(item.result.url)}" controls></video></div>`;
-  workspace.innerHTML = page("产品替换", "按参考视频生成同款", controls, output);
+  if (item.result) {
+    const clockIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 7v5l3 2"/></svg>`;
+    const framesIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="11" height="12" rx="2"/><path d="M9 3h9a2 2 0 0 1 2 2v10"/></svg>`;
+    const resolutionIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5"/></svg>`;
+    const voiceIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13v-2M8 17V7M12 20V4M16 16V8M20 14v-4"/></svg>`;
+    const revoiceIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13v-2M8 17V7M12 19V5M16 15V9"/><path d="M18 5h3v3M21 5l-4 4"/></svg>`;
+    const folderIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v10H3z"/></svg>`;
+    const metric = (icon, label, value) => `<span><i>${icon}</i><b><small>${label}</small><strong>${esc(value)}</strong></b></span>`;
+    const status = item.revoiceError ? `<em class="is-warning">配音待处理</em>` : `<em>✓ 已完成</em>`;
+    output = `<header class="output-heading"><h2>产品替换已完成</h2></header><div class="voice-result-layout"><div class="voice-result-preview"><video src="${esc(item.result.url)}" controls></video></div><aside class="voice-result-side"><section class="voice-result-meta"><header><strong>输出信息</strong>${status}</header><div>${metric(clockIcon, "时长", `${Number(item.result.duration || item.duration).toFixed(0)} 秒`)}${metric(framesIcon, "帧率", "24 FPS")}${metric(resolutionIcon, "分辨率", videoResolution)}${metric(voiceIcon, "声音来源", item.result.voiceName || selectedVoice?.name || (voiceEnabled ? "克隆声音" : "无声音"))}</div>${item.revoiceError ? `<p class="voice-result-warning">克隆配音未完成：${esc(item.revoiceError)}</p>` : ""}</section><section class="voice-result-actions"><header><strong>更多操作</strong></header><div class="voice-result-action-grid"><button class="primary" data-action="voice-revoice" type="button"><i>${revoiceIcon}</i><strong>更换声音并重新配音</strong></button><button class="voice-result-secondary" data-action="voice-view-library" type="button"><i>${folderIcon}</i><strong>查看结果</strong></button></div></section></aside></div>`;
+  }
+  workspace.innerHTML = `${page("产品替换", "多关键帧商品替换", controls, output)}${renderVoiceOverlay(item)}`;
 }
 
 function renderFolderBatchSplit(item) {
@@ -895,7 +1055,7 @@ function render({ preserveScroll = true, preserveControls = false } = {}) {
 function addFile(file, kind, origin) { const item = { name: file.name, url: mediaUrl(file), kind, origin, file, completedAt: new Date().toISOString() }; state.library.unshift(item); sortLibraryNewestFirst(); return item; }
 function runSimulation(key, done) { if (timers.has(key)) return; const item = state[key]; item.running = true; item.progress = 6; item.result = null; item.error = null; render(); const timer = setInterval(() => { item.progress = Math.min(100, item.progress + 9); if (item.progress < 100) return updateProcessingDisplay(); clearInterval(timer); timers.delete(key); item.running = false; item.progress = 0; item.result = done(); render(); notify("模拟处理完成"); }, 180); timers.set(key, timer); }
 
-document.addEventListener("click", (event) => {
+document.addEventListener("click", async (event) => {
   if (event.target.closest("[data-preview-close]")) { closeMediaViewer(); return; }
   const libraryFilter = event.target.closest("[data-library-filter]")?.dataset.libraryFilter;
   if (libraryFilter) { state.libraryFilter = libraryFilter; render(); return; }
@@ -926,28 +1086,159 @@ document.addEventListener("click", (event) => {
   }
   const option = event.target.closest("[data-option]");
   if (option) {
-    const map = { audio: ["remake", "audio"], remakeVoiceSource: ["remake", "voiceSource"], remakeVideoMode: ["remake", "videoMode"], remakeDuration: ["remake", "duration"], splitMode: ["split", "mode"], splitAudio: ["split", "keepAudio"], composeRatio: ["compose", "ratio"], composeResolution: ["compose", "resolution"] };
-    const [section, field] = map[option.dataset.option];
-    const values = { "无声音": "silent", "有声音": "voice", "自动提取": "video", "上传样本": "upload", "关键帧生成": "multi_keyframes", "参考视频生成": "reference_video", "5 秒": 5, "8 秒": 8, "10 秒": 10, "15 秒": 15, "分割": "ffmpeg_only", "分割并命名": "ffmpeg_gemini_naming", "保留原声": true, "去除声音": false };
-    const value = values[option.dataset.value] ?? option.dataset.value;
-    if (option.dataset.option === "remakeVideoMode" && state.remake.videoMode !== value) {
-      Object.assign(state.remake, { runId: null, editedImage: null, editedKeyframes: [], keyframeTimes: [], selectedRetryIndexes: [], imageReady: false, result: null, error: null, progress: 0, stage: "" });
-      if (value === "reference_video" && ![5, 10, 15].includes(state.remake.duration)) state.remake.duration = 5;
-    }
-    if (option.dataset.option === "remakeDuration" && state.remake.duration !== value) {
+    if (option.dataset.option === "remakeDuration") {
+      const value = Number.parseInt(option.dataset.value, 10);
+      if (!Number.isFinite(value) || state.remake.duration === value) return;
+      const resetsOutput = Boolean(state.remake.result || state.remake.error);
       Object.assign(state.remake, { result: null, error: null, progress: 0, stage: "" });
+      if (resetsOutput) { state.remake.duration = value; render(); }
+      else applyRemakeDurationLocally(value, option);
+      return;
     }
+    if (option.dataset.option === "audio") {
+      state.remake.audio = option.dataset.value === "有声音" ? "voice" : "silent";
+      option.parentElement?.querySelectorAll('[data-option="audio"]').forEach((button) => button.classList.toggle("active", button === option));
+      syncRemakeSubmitUi();
+      return;
+    }
+    const map = { audio: ["remake", "audio"], remakeDuration: ["remake", "duration"], splitMode: ["split", "mode"], splitAudio: ["split", "keepAudio"], composeRatio: ["compose", "ratio"], composeResolution: ["compose", "resolution"] };
+    const [section, field] = map[option.dataset.option];
+    const values = { "无声音": "silent", "有声音": "voice", "自动提取": "video", "上传样本": "upload", "5 秒": 5, "8 秒": 8, "10 秒": 10, "15 秒": 15, "分割": "ffmpeg_only", "分割并命名": "ffmpeg_gemini_naming", "保留原声": true, "去除声音": false };
+    const value = values[option.dataset.value] ?? option.dataset.value;
     state[section][field] = value;
     render();
     return;
   }
   const action = event.target.closest("[data-action]")?.dataset.action;
+  if (action === "voice-open-picker") { state.remake.revoicePending = false; replaceVoiceOverlay("picker"); return; }
+  if (action === "voice-open-create") {
+    if (!state.remake.reference || !state.remake.voiceDetected?.hasAudio) { notify("请先选择包含清晰人声的参考视频"); return; }
+    state.remake.revoicePending = false;
+    replaceVoiceOverlay("create");
+    return;
+  }
+  if (action === "voice-close-panel") {
+    const target = event.target.closest("[data-action='voice-close-panel']");
+    if (target?.classList.contains("voice-overlay") && event.target !== target) return;
+    state.remake.revoicePending = false;
+    replaceVoiceOverlay(null);
+    return;
+  }
+  if (action === "voice-preview-play") {
+    const voiceId = event.target.closest("[data-action]")?.dataset.voiceId;
+    const voice = state.remake.voices.find((entry) => entry.id === voiceId);
+    voicePreviewAudio?.pause();
+    if (state.remake.voicePlayingId === voiceId) {
+      state.remake.voicePlayingId = null;
+      voicePreviewAudio = null;
+      syncVoicePlaybackUi();
+      return;
+    }
+    if (!voice?.sampleUrl) { notify("这个声音没有可试听的本地样本"); return; }
+    voicePreviewAudio = new Audio(voice.sampleUrl);
+    state.remake.voicePlayingId = voiceId;
+    syncVoicePlaybackUi();
+    voicePreviewAudio.addEventListener("ended", () => {
+      if (state.remake.voicePlayingId !== voiceId) return;
+      state.remake.voicePlayingId = null;
+      voicePreviewAudio = null;
+      syncVoicePlaybackUi();
+    }, { once: true });
+    voicePreviewAudio.play().catch((error) => {
+      state.remake.voicePlayingId = null;
+      voicePreviewAudio = null;
+      syncVoicePlaybackUi();
+      notify(`试听失败：${error.message}`);
+    });
+    return;
+  }
+  if (action === "voice-select") {
+    state.remake.selectedVoiceId = event.target.closest("[data-action]")?.dataset.voiceId || null;
+    const selectedVoice = state.remake.voices.find((voice) => voice.id === state.remake.selectedVoiceId);
+    const shouldRevoice = state.remake.revoicePending;
+    if (shouldRevoice) {
+      state.remake.revoicePending = false;
+      replaceVoiceOverlay(null);
+      if (selectedVoice?.demo) { syncRemakeVoiceChoice(); notify("演示音色不会提交真实重新配音"); }
+      else void revoiceCurrentResult();
+    } else {
+      syncVoiceLibrarySelectionUi();
+      syncRemakeVoiceChoice();
+      notify(`已选择 ${selectedVoice?.name || "音色"}，可继续试听`);
+    }
+    return;
+  }
+  if (action === "voice-create") {
+    if (state.remake.voiceBusy || !state.remake.reference?.file) return;
+    const name = document.querySelector("#voiceNameInput")?.value.trim() || "新建声音";
+    state.remake.voiceBusy = true;
+    const createButton = event.target.closest("[data-action='voice-create']");
+    const nameInput = workspace.querySelector("#voiceNameInput");
+    if (createButton) { createButton.disabled = true; createButton.textContent = "正在创建…"; }
+    if (nameInput) nameInput.disabled = true;
+    try {
+      const voice = await videoClient.createVoice(state.remake.reference.file, name);
+      state.remake.voices.unshift(voice);
+      state.remake.selectedVoiceId = voice.id;
+      replaceVoiceOverlay(null);
+      syncRemakeVoiceChoice();
+      notify("声音已创建并保存，可直接用于本次生成");
+    } catch (error) {
+      notify(`创建声音失败：${error.message}`);
+    } finally {
+      state.remake.voiceBusy = false;
+      if (state.remake.voicePanel === "create") replaceVoiceOverlay("create");
+    }
+    return;
+  }
+  if (action === "voice-delete") {
+    const voiceId = event.target.closest("[data-action]")?.dataset.voiceId;
+    const voice = state.remake.voices.find((entry) => entry.id === voiceId);
+    if (!voice) return;
+    showVoiceDeleteConfirm(voice);
+    return;
+  }
+  if (action === "voice-delete-cancel") {
+    const layer = event.target.closest("[data-action='voice-delete-cancel']");
+    if (layer?.classList.contains("voice-delete-confirm-layer") && event.target !== layer) return;
+    workspace.querySelector(".voice-delete-confirm-layer")?.remove();
+    return;
+  }
+  if (action === "voice-delete-confirm") {
+    const confirmButton = event.target.closest("[data-action='voice-delete-confirm']");
+    const voiceId = confirmButton?.dataset.voiceId;
+    const voice = state.remake.voices.find((entry) => entry.id === voiceId);
+    if (!voice) return;
+    confirmButton.disabled = true;
+    confirmButton.textContent = "正在删除…";
+    try {
+      await videoClient.deleteVoice(voiceId);
+      state.remake.voices = state.remake.voices.filter((entry) => entry.id !== voiceId);
+      if (state.remake.selectedVoiceId === voiceId) state.remake.selectedVoiceId = null;
+      replaceVoiceOverlay("picker");
+      syncRemakeVoiceChoice();
+      notify("音色已删除");
+    } catch {
+      confirmButton.disabled = false;
+      confirmButton.textContent = "删除音色";
+      notify("删除失败，请稍后重试");
+    }
+    return;
+  }
+  if (action === "voice-revoice") { state.remake.revoicePending = true; replaceVoiceOverlay("picker"); return; }
+  if (action === "voice-view-library") {
+    state.active = "library";
+    state.libraryRunFilter = "remake";
+    state.libraryView = { runId: state.remake.result?.sourceId || state.remake.result?.runId || state.remake.runId, categoryId: null };
+    render({ preserveScroll: false });
+    return;
+  }
   if (action === "open-kling" || action === "open-shot") {
     videoClient.openWorkspace(action === "open-kling" ? "kling" : "shot").catch((error) => notify(error.message));
     return;
   }
   if (action === "toggle-remake-voice") {
-    if (state.remake.running || state.remake.imageReady) return;
+    if (state.remake.running) return;
     const enabled = !state.remake.voiceEnabled;
     state.remake.voiceEnabled = enabled;
     state.remake.audio = enabled ? "voice" : "silent";
@@ -961,12 +1252,14 @@ document.addEventListener("click", (event) => {
     toggle.setAttribute("aria-label", enabled ? "关闭声音与口型" : "开启声音与口型");
     reveal.setAttribute("aria-hidden", String(!enabled));
     const voiceLimit = state.remake.duration * 6;
-    const voiceReferenceReady = state.remake.voiceSource === "upload" ? Boolean(state.remake.voiceSample) : state.remake.voiceDetected?.hasAudio === true;
-    const voiceSettingsValid = !enabled || (Boolean(state.remake.voiceScript.trim()) && state.remake.voiceScript.length <= voiceLimit && voiceReferenceReady);
+    const selectedVoice = state.remake.voices.find((voice) => voice.id === state.remake.selectedVoiceId);
+    const voiceSettingsValid = !enabled || (Boolean(state.remake.voiceScript.trim()) && state.remake.voiceScript.length <= voiceLimit && Boolean(selectedVoice) && selectedVoice.demo !== true);
     const generateButton = document.querySelector('[data-action="remake-generate"]');
     if (generateButton) generateButton.disabled = state.remake.config?.configured !== true || state.remake.running || state.remake.imageReady || !state.remake.products.length || !state.remake.reference || !voiceSettingsValid;
+    const confirmButton = document.querySelector('[data-action="confirm-remake-image"]');
+    if (confirmButton) confirmButton.disabled = !voiceSettingsValid;
     const submitNote = document.querySelector(".submit small");
-    if (submitNote && state.remake.products.length && state.remake.reference && state.remake.config?.configured === true) submitNote.textContent = `确认全部替换关键帧后再生成视频 · ${state.remake.duration} 秒 · 9:16 · 768P · ${enabled ? "使用参考音色生成口型与声音" : "不生成声音与口型"}`;
+    if (submitNote && state.remake.products.length && state.remake.reference && state.remake.config?.configured === true) submitNote.textContent = `确认全部替换关键帧后再生成视频 · ${state.remake.duration} 秒 · 9:16 · 768P · ${enabled ? "使用已选声音生成口型与配音" : "不生成声音与口型"}`;
     return;
   }
   if (action === "retry-remake") { void recoverRemake(); return; }
@@ -1007,11 +1300,22 @@ document.addEventListener("click", (event) => {
     return;
   }
   if (action === "toggle-remake-image") {
-    const index = Number(event.target.closest("[data-action]")?.dataset.keyframeIndex);
+    const button = event.target.closest("[data-action='toggle-remake-image']");
+    const index = Number(button?.dataset.keyframeIndex);
     const selected = new Set(state.remake.selectedRetryIndexes || []);
     if (selected.has(index)) selected.delete(index); else selected.add(index);
     state.remake.selectedRetryIndexes = [...selected].sort((a, b) => a - b);
-    render();
+    const isSelected = selected.has(index);
+    button?.closest("article")?.classList.toggle("is-selected", isSelected);
+    if (button) {
+      button.setAttribute("aria-pressed", String(isSelected));
+      button.innerHTML = `<i aria-hidden="true">${isSelected ? "✓" : ""}</i>${isSelected ? "已选择" : "选择重做"}`;
+    }
+    const retryButton = workspace.querySelector('[data-action="retry-selected-remake-images"]');
+    if (retryButton) {
+      retryButton.disabled = selected.size === 0;
+      retryButton.textContent = `重新生成所选${selected.size ? `（${selected.size}）` : ""}`;
+    }
     return;
   }
   if (action === "retry-selected-remake-images") { void retryRemakeImages(state.remake.selectedRetryIndexes); return; }
@@ -1062,8 +1366,10 @@ document.addEventListener("input", (event) => {
     const count = document.querySelector(".voice-script label b");
     if (count) count.textContent = event.target.value.length;
     const button = document.querySelector('[data-action="remake-generate"]');
-    const voiceReferenceReady = state.remake.voiceSource === "upload" ? Boolean(state.remake.voiceSample) : state.remake.voiceDetected?.hasAudio === true;
-    if (button) button.disabled = state.remake.config?.configured !== true || state.remake.running || !state.remake.products.length || !state.remake.reference || !event.target.value.trim() || !voiceWithinLimit || !voiceReferenceReady;
+    const selectedVoice = state.remake.voices.find((voice) => voice.id === state.remake.selectedVoiceId);
+    if (button) button.disabled = state.remake.config?.configured !== true || state.remake.running || !state.remake.products.length || !state.remake.reference || !event.target.value.trim() || !voiceWithinLimit || !selectedVoice || selectedVoice.demo === true;
+    const confirmButton = document.querySelector('[data-action="confirm-remake-image"]');
+    if (confirmButton) confirmButton.disabled = state.remake.voiceEnabled && (!event.target.value.trim() || !voiceWithinLimit || !selectedVoice || selectedVoice.demo === true);
     return;
   }
   if (event.target.id === "audioScript") state.audio.script = event.target.value;
@@ -1096,10 +1402,6 @@ document.addEventListener("change", async (event) => {
       return;
     }
     Object.assign(state.remake, { runId: null, editedImage: null, editedKeyframes: [], keyframeTimes: [], imageReady: false, result: null, error: null, progress: 0, stage: "" });
-  }
-  if (event.target.id === "voiceSampleInput") {
-    state.remake.voiceSample = { name: files[0].name, url: mediaUrl(files[0]), file: files[0], meta: `${formatFileSize(files[0].size)} · 声音样本` };
-    Object.assign(state.remake, { runId: null, result: null, error: null, progress: 0, stage: "" });
   }
   if (event.target.id === "splitInput") {
     const selected = files.slice(0, 25).map((file) => ({ name: file.name, url: mediaUrl(file), kind: "video", origin: "素材分割输入", file, size: formatFileSize(file.size) }));
@@ -1166,6 +1468,14 @@ async function loadKlingConfig() {
     if (state.active === "remake") render();
   } catch {}
 }
+async function loadVoices() {
+  try {
+    state.remake.voices = await videoClient.listVoices();
+    if (state.remake.selectedVoiceId && !state.remake.voices.some((voice) => voice.id === state.remake.selectedVoiceId)) state.remake.selectedVoiceId = null;
+    if (!state.remake.selectedVoiceId && state.remake.voices.length) state.remake.selectedVoiceId = state.remake.voices[0].id;
+    if (state.active === "remake") render();
+  } catch {}
+}
 async function loadKlingAssets() {
   if (klingAssetsLoading) return;
   klingAssetsLoading = true;
@@ -1174,13 +1484,13 @@ async function loadKlingAssets() {
     for (const asset of response.assets || []) {
       const remoteKey = `${asset.runId}:${asset.relativeUrl}`;
       if (state.library.some((item) => item.remoteKey === remoteKey)) continue;
-      state.library.push({ name: asset.name, url: new URL(asset.relativeUrl, response.baseUrl).toString(), kind: "video", origin: "产品替换", remoteKey, runId: asset.runId, sourceId: asset.sourceId, sourceFolderName: asset.sourceFolderName, sourceFilename: asset.sourceFilename, workflow: "remake", completedAt: asset.completedAt });
+      state.library.push({ name: asset.name, url: new URL(asset.relativeUrl, response.baseUrl).toString(), kind: "video", origin: "产品替换", remoteKey, runId: asset.runId, sourceId: asset.sourceId, sourceFolderName: asset.sourceFolderName, sourceFilename: asset.sourceFilename, workflow: "remake", voiceName: asset.voiceName, completedAt: asset.completedAt });
     }
     sortLibraryNewestFirst();
     if (state.active === "library") render();
   } catch {} finally { klingAssetsLoading = false; }
 }
-function showServices(services) { const ready = services.filter((service) => service.status === "ready").length; serviceStatus.textContent = ready === 2 ? "两个本地服务已就绪" : `${ready}/${services.length || 2} 个服务就绪`; serviceStatus.className = ready === 2 ? "ready" : services.some((service) => service.status === "error") ? "error" : ""; if (services.some((service) => service.key === "shot" && service.status === "ready")) { if (!state.split.config) void loadShotConfig(); void loadShotAssets(); void loadLatestInterruptedBatch(); } if (services.some((service) => service.key === "kling" && service.status === "ready")) { if (!state.remake.config) void loadKlingConfig(); void loadKlingAssets(); } }
+function showServices(services) { const ready = services.filter((service) => service.status === "ready").length; serviceStatus.textContent = ready === 2 ? "两个本地服务已就绪" : `${ready}/${services.length || 2} 个服务就绪`; serviceStatus.className = ready === 2 ? "ready" : services.some((service) => service.status === "error") ? "error" : ""; if (services.some((service) => service.key === "shot" && service.status === "ready")) { if (!state.split.config) void loadShotConfig(); void loadShotAssets(); void loadLatestInterruptedBatch(); } if (services.some((service) => service.key === "kling" && service.status === "ready")) { if (!state.remake.config) void loadKlingConfig(); void loadKlingAssets(); if (!state.remake.voices.length) void loadVoices(); } }
 if (uiPreviewMode === "batch-split") {
   state.active = "split";
   state.split.batch = {
@@ -1206,14 +1516,27 @@ if (uiPreviewMode === "batch-split") {
   serviceStatus.textContent = "批量界面预览 · 未启动真实服务";
   serviceStatus.className = "";
   render();
+} else if (uiPreviewMode === "voice-result") {
+  state.active = "remake";
+  Object.assign(state.remake, {
+    duration: 5,
+    voiceScript: "麻辣鲜香，肉质Q弹，现捞现做。",
+    voices: [{ id: "preview-voice", name: "螺蛳视频人物", duration: 12.7, sampleUrl: null }],
+    selectedVoiceId: "preview-voice",
+    result: { name: "商品替换成片_克隆配音.mp4", url: "../../../video-mix-standalone/assets/video-remake/spring-water-result-5s.mp4", runId: "preview-run", sourceId: "preview-run", duration: 5, voiceName: "螺蛳视频人物", completedAt: new Date().toISOString() },
+    config: { configured: true, klingConfigured: true, referenceVideoConfigured: true }
+  });
+  serviceStatus.textContent = "结果界面预览 · 未启动真实服务";
+  serviceStatus.className = "";
+  render();
 } else if (uiPreviewMode === "processing") {
   state.active = "remake";
   Object.assign(state.remake, {
     running: true,
     progress: 78,
     routeIndex: 2,
-    stage: "根据参考视频生成替换视频",
-    videoMode: "reference_video",
+    stage: "根据关键帧生成替换视频",
+    videoMode: "multi_keyframes",
     voiceScript: "界面预览",
     config: { configured: true, klingConfigured: true, referenceVideoConfigured: true }
   });

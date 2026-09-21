@@ -1,10 +1,10 @@
 import { app, BrowserWindow, Menu, ipcMain, shell } from "electron";
 import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync, openAsBlob } from "node:fs";
-import { mkdir, readdir, readFile, rm } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -21,6 +21,9 @@ const resourceRoot = app.isPackaged ? process.resourcesPath : projectRoot;
 const clientDataRoot = path.resolve(process.env.CLIENT_DATA_DIR || (app.isPackaged ? path.join(app.getPath("videos"), "章域 AI") : path.join(projectRoot, "client-data")));
 const shotRunsDir = path.join(clientDataRoot, "video-shot", "runs-v1");
 const klingRunsDir = path.join(clientDataRoot, "kling-h3", "runs");
+const voiceDataRoot = path.join(clientDataRoot, "voices");
+const voiceRegistryPath = path.join(voiceDataRoot, "voices.json");
+const revoicedOutputRoot = path.join(clientDataRoot, "kling-h3", "revoiced");
 const bundledFfmpegPath = path.join(resourceRoot, "tools", "ffmpeg", "ffmpeg.exe");
 const bundledFfprobePath = path.join(resourceRoot, "tools", "ffmpeg", "ffprobe.exe");
 const bundledCloudflaredPath = path.join(resourceRoot, "tools", "cloudflared", "cloudflared.exe");
@@ -334,18 +337,15 @@ function keyframeCount(duration) {
   return duration <= 5 ? 4 : duration <= 10 ? 5 : 6;
 }
 
-async function createKlingRun({ videoPath, productPath, voiceScript, audioMode, videoMode, duration, voiceSource, voiceSamplePath }) {
+async function createKlingRun({ videoPath, productPath, voiceScript, audioMode, videoMode, duration, voiceId }) {
   if (!videoPath || !productPath) throw new Error("请先选择产品图和参考视频");
   const selectedVideoMode = videoMode === "reference_video" ? "reference_video" : "multi_keyframes";
   const script = selectedVideoMode === "reference_video" ? "" : String(voiceScript || "").trim();
   const voiceEnabled = selectedVideoMode !== "reference_video" && audioMode !== "silent";
-  const selectedVoiceSource = voiceSource === "upload" ? "upload" : "source_video";
+  const selectedVoice = voiceEnabled ? await resolveVoice(voiceId) : null;
+  const selectedVoiceSource = voiceEnabled ? "upload" : "source_video";
   if (voiceEnabled && !script) throw new Error("声音与口型开启时请输入台词");
-  if (voiceEnabled && selectedVoiceSource === "upload" && !voiceSamplePath) throw new Error("请先上传声音样本");
-  if (voiceEnabled && selectedVoiceSource === "source_video") {
-    const audioInfo = await inspectReferenceAudio(videoPath);
-    if (!audioInfo.hasAudio) throw new Error("参考视频没有可提取的音轨，请关闭声音与口型或改用上传样本");
-  }
+  if (voiceEnabled && !selectedVoice?.samplePath) throw new Error("所选声音缺少本地参考样本，请重新创建声音");
   const config = await klingRequest("api/config");
   if (selectedVideoMode === "reference_video" ? !config.klingConfigured : !config.configured) throw new Error(selectedVideoMode === "reference_video" ? "Kling API Key 尚未配置" : "商品替换服务尚未配置两个 API Key");
   const selectedDuration = normalizeKlingDuration(duration);
@@ -364,7 +364,7 @@ async function createKlingRun({ videoPath, productPath, voiceScript, audioMode, 
     return klingRequest("api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId, sourceVideoId: sourceVideo.id, productImageId: productImage.id, imagePrompt: KLING_IMAGE_PROMPT, videoPrompt, voiceScript: script, audioMode: audioMode === "silent" ? "silent" : "voice", videoMode: selectedVideoMode, publicBaseUrl, resolution: "720P", duration: selectedDuration }) });
   }
   const { runId } = await klingRequest("api/run-id", { method: "POST" });
-  const publicBaseUrl = voiceEnabled ? await ensureQuickTunnel(getReadyKlingService()) : null;
+  const publicBaseUrl = await ensureQuickTunnel(getReadyKlingService());
   const tempDir = path.join(app.getPath("temp"), "video-client-electron", "keyframes", runId);
   await mkdir(tempDir, { recursive: true });
   try {
@@ -381,8 +381,8 @@ async function createKlingRun({ videoPath, productPath, voiceScript, audioMode, 
       uploadKlingMedia(runId, productPath, "image", "inputs/product-image"),
       ...keyframePaths.map((filePath, index) => uploadKlingMedia(runId, filePath, "image", "keyframes/source", `keyframe-${index + 1}.png`))
     ]);
-    const voiceAudio = voiceEnabled && selectedVoiceSource === "upload"
-      ? await uploadKlingMedia(runId, voiceSamplePath, "audio", "inputs/voice-audio")
+    const voiceAudio = voiceEnabled
+      ? await uploadKlingMedia(runId, selectedVoice.samplePath, "audio", "inputs/voice-audio")
       : null;
     return klingRequest("api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId, sourceVideoId: sourceVideo.id, productImageId: productImage.id, voiceAudioId: voiceAudio?.id || null, voiceSource: selectedVoiceSource, keyframeIds: keyframes.map((item) => item.id), keyframeTimes, imagePrompt: KLING_IMAGE_PROMPT, videoPrompt: klingVideoPrompt(script, selectedVideoMode, selectedDuration, keyframeTimes), voiceScript: script, audioMode: voiceEnabled ? "voice" : "silent", videoMode: selectedVideoMode, publicBaseUrl, resolution: "768P", duration: selectedDuration }) });
   } finally {
@@ -412,9 +412,22 @@ async function retryKlingImage(runId, indexes) {
 
 async function listKlingAssets() {
   const response = await klingRequest("api/runs");
+  let revoicedAssets = [];
+  try {
+    const files = await readdir(revoicedOutputRoot);
+    revoicedAssets = (await Promise.all(files.filter((name) => name.endsWith(".json")).map(async (name) => {
+      try {
+        const meta = JSON.parse(await readFile(path.join(revoicedOutputRoot, name), "utf8"));
+        if (!meta.path || !existsSync(meta.path)) return null;
+        return { runId: meta.runId, sourceId: meta.runId, sourceFilename: meta.sourceFilename || "商品替换", sourceFolderName: path.parse(meta.sourceFilename || "商品替换").name, workflow: "remake", name: meta.name || "商品替换成片_克隆配音.mp4", relativeUrl: pathToFileURL(meta.path).toString(), completedAt: meta.completedAt, audioMode: "voice", voiceName: meta.voiceName };
+      } catch { return null; }
+    }))).filter(Boolean);
+  } catch {}
+  const revoicedRunIds = new Set(revoicedAssets.map((asset) => asset.runId));
+  const providerAssets = (response.runs || []).filter((run) => run.stage === "video" && String(run.status).toUpperCase() === "SUCCEEDED" && run.output?.url && !revoicedRunIds.has(run.id)).map((run) => ({ runId: run.id, sourceId: run.id, sourceFilename: run.sourceVideo?.name || "商品替换", sourceFolderName: path.parse(run.sourceVideo?.name || "商品替换").name, workflow: "remake", name: run.output.name || "商品替换成片.mp4", relativeUrl: run.output.url, completedAt: run.updatedAt || run.createdAt, audioMode: run.audioMode || "voice" }));
   return {
     baseUrl: response.baseUrl,
-    assets: (response.runs || []).filter((run) => run.stage === "video" && String(run.status).toUpperCase() === "SUCCEEDED" && run.output?.url).map((run) => ({ runId: run.id, sourceId: run.id, sourceFilename: run.sourceVideo?.name || "商品替换", sourceFolderName: path.parse(run.sourceVideo?.name || "商品替换").name, workflow: "remake", name: run.output.name || "商品替换成片.mp4", relativeUrl: run.output.url, completedAt: run.updatedAt || run.createdAt, audioMode: run.audioMode || "voice" }))
+    assets: [...revoicedAssets, ...providerAssets]
   };
 }
 
@@ -424,6 +437,187 @@ async function readEnvValue(filePath, key) {
     if (!line) return "";
     return line.slice(line.indexOf("=") + 1).trim().replace(/^(['"])(.*)\1$/, "$2");
   } catch { return ""; }
+}
+
+const voiceTargetModel = "qwen-audio-3.0-tts-plus";
+const dashscopeApiBase = "https://dashscope.aliyuncs.com/api/v1/services/audio/tts";
+
+async function voiceApiKey() {
+  const service = getReadyKlingService();
+  const envPath = path.join(service.definition.cwd, ".env");
+  return (await readEnvValue(envPath, "DASHSCOPE_API_KEY")) || (await readEnvValue(envPath, "BAILIAN_API_KEY"));
+}
+
+async function readVoiceRegistry() {
+  try {
+    const parsed = JSON.parse(await readFile(voiceRegistryPath, "utf8"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeVoiceRegistry(voices) {
+  await mkdir(voiceDataRoot, { recursive: true });
+  const tempPath = `${voiceRegistryPath}.tmp`;
+  await writeFile(tempPath, `${JSON.stringify(voices, null, 2)}\n`, "utf8");
+  await rename(tempPath, voiceRegistryPath);
+}
+
+function publicVoice(voice) {
+  return {
+    id: voice.id,
+    name: voice.name,
+    model: voice.model,
+    createdAt: voice.createdAt,
+    duration: voice.duration,
+    demo: voice.demo === true,
+    sampleUrl: voice.samplePath ? pathToFileURL(voice.samplePath).toString() : null
+  };
+}
+
+async function listVoices() {
+  return (await readVoiceRegistry()).map(publicVoice);
+}
+
+async function resolveVoice(voiceId) {
+  const voice = (await readVoiceRegistry()).find((entry) => entry.id === voiceId);
+  if (!voice) throw new Error("所选声音不存在，请重新选择或创建声音");
+  if (voice.demo === true) throw new Error("演示音色仅用于查看选择和删除逻辑，不能提交真实生成");
+  return voice;
+}
+
+async function dashscopeRequest(pathname, payload) {
+  const key = await voiceApiKey();
+  if (!key) throw new Error("声音服务尚未配置阿里云百炼 API Key");
+  const response = await fetch(`${dashscopeApiBase}/${pathname}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.message || body.code || `声音服务请求失败：HTTP ${response.status}`);
+  return body;
+}
+
+async function createVoice({ sourcePath, name }) {
+  if (!sourcePath) throw new Error("请先选择包含清晰人声的参考视频");
+  const duration = await videoDurationSeconds(sourcePath);
+  if (duration < 3) throw new Error("参考声音至少需要 3 秒");
+  await mkdir(voiceDataRoot, { recursive: true });
+  const localId = `voice_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+  const samplePath = path.join(voiceDataRoot, `${localId}.mp3`);
+  await execFileAsync(runtimeFfmpegPath, ["-y", "-i", sourcePath, "-map", "0:a:0", "-t", String(Math.min(30, duration)), "-vn", "-ac", "1", "-ar", "24000", "-c:a", "libmp3lame", "-b:a", "96k", samplePath], { windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+
+  try {
+    const { runId } = await klingRequest("api/run-id", { method: "POST" });
+    const uploaded = await uploadKlingMedia(runId, samplePath, "audio", "inputs/voice-audio", `${localId}.mp3`);
+    const publicBaseUrl = await ensureQuickTunnel(getReadyKlingService());
+    const prefix = `zy${Date.now().toString(36).slice(-8)}`.slice(0, 10);
+    const response = await dashscopeRequest("customization", {
+      model: "voice-enrollment",
+      input: {
+        action: "create_voice",
+        target_model: voiceTargetModel,
+        prefix,
+        url: new URL(uploaded.url, publicBaseUrl).toString(),
+        language_hints: ["zh"],
+        max_prompt_audio_length: Math.min(30, duration),
+        enable_preprocess: true,
+        enable_volume_normalization: "true"
+      }
+    });
+    const voiceId = response.output?.voice_id;
+    if (!voiceId) throw new Error("声音服务没有返回音色 ID");
+    const voices = await readVoiceRegistry();
+    const voice = { id: voiceId, name: String(name || "新建声音").trim().slice(0, 20) || "新建声音", model: voiceTargetModel, createdAt: new Date().toISOString(), duration: Math.min(30, duration), samplePath };
+    voices.unshift(voice);
+    await writeVoiceRegistry(voices);
+    return publicVoice(voice);
+  } catch (error) {
+    await rm(samplePath, { force: true });
+    throw error;
+  }
+}
+
+async function deleteVoice(voiceId) {
+  const voices = await readVoiceRegistry();
+  const voice = voices.find((entry) => entry.id === voiceId);
+  if (!voice) return { deleted: false };
+  if (voice.demo !== true) await dashscopeRequest("customization", { model: "voice-enrollment", input: { action: "delete_voice", voice_id: voice.id } });
+  await writeVoiceRegistry(voices.filter((entry) => entry.id !== voice.id));
+  if (voice.samplePath) await rm(voice.samplePath, { force: true });
+  return { deleted: true };
+}
+
+function atempoFilter(rate) {
+  const parts = [];
+  let remaining = rate;
+  while (remaining > 2) { parts.push("atempo=2"); remaining /= 2; }
+  while (remaining < 0.5) { parts.push("atempo=0.5"); remaining /= 0.5; }
+  parts.push(`atempo=${remaining.toFixed(6)}`);
+  return parts.join(",");
+}
+
+async function detectSpeechWindow(videoPath, duration) {
+  try {
+    const sink = process.platform === "win32" ? "NUL" : "/dev/null";
+    const { stderr } = await execFileAsync(runtimeFfmpegPath, ["-hide_banner", "-nostats", "-i", videoPath, "-map", "0:a:0", "-af", "silencedetect=n=-35dB:d=0.15", "-f", "null", sink], { windowsHide: true, encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
+    const starts = [...String(stderr).matchAll(/silence_start:\s*([0-9.]+)/g)].map((match) => Number(match[1]));
+    const ends = [...String(stderr).matchAll(/silence_end:\s*([0-9.]+)/g)].map((match) => Number(match[1]));
+    const start = starts[0] <= 0.1 && ends.length ? ends[0] : 0;
+    const lastStart = starts.at(-1);
+    const lastEnd = ends.at(-1);
+    const end = Number.isFinite(lastStart) && (!Number.isFinite(lastEnd) || lastStart > lastEnd) ? lastStart : duration;
+    if (end - start >= 0.5) return { start, end };
+  } catch {}
+  return { start: 0, end: duration };
+}
+
+async function materializeVideo(videoUrl, targetPath) {
+  if (String(videoUrl).startsWith("file:")) {
+    await copyFile(fileURLToPath(videoUrl), targetPath);
+    return;
+  }
+  const response = await fetch(videoUrl);
+  if (!response.ok) throw new Error(`无法读取已生成视频：HTTP ${response.status}`);
+  await writeFile(targetPath, Buffer.from(await response.arrayBuffer()));
+}
+
+async function revoiceVideo({ videoUrl, runId, voiceId, text }) {
+  if (!videoUrl || !runId) throw new Error("缺少可重新配音的视频结果");
+  if (!String(text || "").trim()) throw new Error("请输入需要生成的台词");
+  const voice = await resolveVoice(voiceId);
+  const tempRoot = path.join(app.getPath("temp"), "video-client-electron", "revoice", `${runId}-${Date.now()}`);
+  const sourceVideoPath = path.join(tempRoot, "source.mp4");
+  const generatedAudioPath = path.join(tempRoot, "voice.wav");
+  await mkdir(tempRoot, { recursive: true });
+  await mkdir(revoicedOutputRoot, { recursive: true });
+  try {
+    await materializeVideo(videoUrl, sourceVideoPath);
+    const response = await dashscopeRequest("SpeechSynthesizer", {
+      model: voice.model || voiceTargetModel,
+      input: { text: String(text).trim(), voice: voice.id, format: "wav", sample_rate: 24000, rate: 1, pitch: 1, language_hints: ["zh"] }
+    });
+    const audioUrl = response.output?.audio?.url;
+    if (!audioUrl) throw new Error("声音服务没有返回生成音频");
+    const audioResponse = await fetch(audioUrl);
+    if (!audioResponse.ok) throw new Error(`下载生成音频失败：HTTP ${audioResponse.status}`);
+    await writeFile(generatedAudioPath, Buffer.from(await audioResponse.arrayBuffer()));
+    const [videoDuration, audioDuration] = await Promise.all([videoDurationSeconds(sourceVideoPath), videoDurationSeconds(generatedAudioPath)]);
+    const speechWindow = await detectSpeechWindow(sourceVideoPath, videoDuration);
+    const outputPath = path.join(revoicedOutputRoot, `${runId}-${Date.now()}.mp4`);
+    const targetSpeechDuration = Math.max(0.5, speechWindow.end - speechWindow.start);
+    const rate = Math.max(0.05, audioDuration / targetSpeechDuration);
+    const delayMs = Math.max(0, Math.round(speechWindow.start * 1000));
+    await execFileAsync(runtimeFfmpegPath, ["-y", "-i", sourceVideoPath, "-i", generatedAudioPath, "-filter_complex", `[1:a]${atempoFilter(rate)},adelay=${delayMs}:all=1,apad[a]`, "-map", "0:v:0", "-map", "[a]", "-t", String(videoDuration), "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", outputPath], { windowsHide: true, maxBuffer: 16 * 1024 * 1024 });
+    const completedAt = new Date().toISOString();
+    const name = "商品替换成片_克隆配音.mp4";
+    await writeFile(`${outputPath}.json`, `${JSON.stringify({ runId, path: outputPath, name, voiceId: voice.id, voiceName: voice.name, completedAt }, null, 2)}\n`, "utf8");
+    return { name, url: pathToFileURL(outputPath).toString(), voiceId: voice.id, voiceName: voice.name, duration: videoDuration, completedAt };
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
 }
 
 function validateRunId(runId) {
@@ -687,6 +881,10 @@ ipcMain.handle("kling-start-video", (_event, runId, voiceScript, videoMode, dura
 ipcMain.handle("kling-inspect-reference-audio", (_event, videoPath) => inspectReferenceAudio(videoPath));
 ipcMain.handle("kling-resume-run", (_event, runId) => resumeKlingRun(runId));
 ipcMain.handle("kling-retry-image", (_event, runId, indexes) => retryKlingImage(runId, indexes));
+ipcMain.handle("voice-list", () => listVoices());
+ipcMain.handle("voice-create", (_event, payload) => createVoice(payload || {}));
+ipcMain.handle("voice-delete", (_event, voiceId) => deleteVoice(voiceId));
+ipcMain.handle("voice-revoice-video", (_event, payload) => revoiceVideo(payload || {}));
 ipcMain.handle("shot-get-config", () => shotRequest("api/config"));
 ipcMain.handle("shot-list-assets", () => listShotAssets());
 ipcMain.handle("shot-create-run", (_event, payload) => createShotRun(payload || {}));

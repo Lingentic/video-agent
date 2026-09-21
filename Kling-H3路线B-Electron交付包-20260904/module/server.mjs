@@ -20,8 +20,9 @@ const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 220 * 1024 * 102
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 60_000);
 const MOCK = /^true$/i.test(process.env.MOCK_PIPELINE || "");
 const KLING_API_BASE = (process.env.KLING_API_BASE || "https://api-singapore.klingai.com").replace(/\/$/, "");
-const KLING_IMAGE_MODEL = process.env.KLING_IMAGE_MODEL || "kling-image-o1";
-const KLING_IMAGE_RESOLUTION = process.env.KLING_IMAGE_RESOLUTION || "1k";
+const BAILIAN_API_BASE = (process.env.BAILIAN_API_BASE || "https://dashscope.aliyuncs.com").replace(/\/$/, "");
+const BAILIAN_IMAGE_MODEL = process.env.BAILIAN_IMAGE_MODEL || "kling/kling-v3-omni-image-generation";
+const BAILIAN_IMAGE_RESOLUTION = process.env.BAILIAN_IMAGE_RESOLUTION || "1k";
 const KLING_VIDEO_OMNI_MODEL = process.env.KLING_VIDEO_OMNI_MODEL || "kling-3.0-omni";
 const H3_API_BASE = (process.env.XINHANKR_API_BASE || "https://token.xinhankr.com").replace(/\/$/, "");
 const H3_OPEN_MODEL = process.env.XINHANKR_H3_OPEN_MODEL || "MiniMax-H3";
@@ -203,10 +204,6 @@ async function receiveMedia(req, kind, runId, category, originalName) {
   return item;
 }
 
-async function dataBase64(item) {
-  return (await readFile(item.path)).toString("base64");
-}
-
 async function cloneMediaItem(item, runId, category) {
   if (!item?.path) return null;
   const id = randomUUID();
@@ -265,7 +262,7 @@ async function providerFetch(base, path, key, provider, options = {}) {
 }
 
 function taskId(payload) {
-  return payload?.task_id || payload?.task?.id || payload?.id || payload?.data?.id || payload?.data?.task_id || payload?.data?.task_info?.task_id;
+  return payload?.task_id || payload?.output?.task_id || payload?.task?.id || payload?.id || payload?.data?.id || payload?.data?.task_id || payload?.data?.task_info?.task_id;
 }
 
 function normalized(value) {
@@ -332,7 +329,10 @@ function finishStageTiming(run, stage, at = new Date().toISOString()) {
   run.timing.totalElapsedMs = elapsedMs(run.timing.runStartedAt, at);
 }
 
-function klingImageResult(payload) {
+function bailianImageResult(payload) {
+  const content = payload?.output?.choices?.[0]?.message?.content;
+  const officialImage = Array.isArray(content) ? content.find((item) => item?.image)?.image : null;
+  if (officialImage) return officialImage;
   const task = payload?.data || payload;
   const values = task?.task_result?.images || task?.images || task?.outputs || [];
   const item = Array.isArray(values) ? values[0] : values;
@@ -394,28 +394,35 @@ async function removeOutputAudio(run) {
 }
 
 async function submitImageTask(run, frame, index) {
-  const externalTaskId = `${run.id}-image-${index + 1}-${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+  if (!run.publicBaseUrl && !MOCK) throw new HttpError(409, "阿里云百炼图片替换需要临时公网素材通道");
+  const publicMediaUrl = (item) => new URL(publicMedia(item).url, run.publicBaseUrl).toString();
   const request = {
-    model_name: KLING_IMAGE_MODEL,
-    prompt: run.imagePrompt,
-    image_list: [{ image: await dataBase64(frame) }, { image: await dataBase64(run.productImage) }],
-    resolution: KLING_IMAGE_RESOLUTION,
-    result_type: "single",
-    n: 1,
-    aspect_ratio: "auto",
-    watermark_info: { enabled: false },
-    external_task_id: externalTaskId
+    model: BAILIAN_IMAGE_MODEL,
+    input: {
+      messages: [{
+        role: "user",
+        content: [
+          { text: run.imagePrompt },
+          { image: MOCK ? `https://mock.invalid/source-${index + 1}.png` : publicMediaUrl(frame) },
+          { image: MOCK ? "https://mock.invalid/product.png" : publicMediaUrl(run.productImage) }
+        ]
+      }]
+    },
+    parameters: { n: 1, result_type: "single", aspect_ratio: run.ratio || "9:16", resolution: BAILIAN_IMAGE_RESOLUTION, watermark: false }
   };
-  const task = { index, externalTaskId, taskId: null, status: "PENDING", editedImage: null, lastResponse: null, request: { ...request, image_list: [{ image: `[base64 keyframe ${index + 1}]` }, { image: "[base64 product image]" }] } };
+  const loggedRequest = structuredClone(request);
+  loggedRequest.input.messages[0].content[1].image = `[temporary HTTPS keyframe ${index + 1}]`;
+  loggedRequest.input.messages[0].content[2].image = "[temporary HTTPS product image]";
+  const task = { index, taskId: null, status: "PENDING", editedImage: null, lastResponse: null, request: loggedRequest };
   if (MOCK) {
     task.taskId = `mock-image-${index + 1}-${Date.now()}`;
   } else {
-    const response = await providerFetch(KLING_API_BASE, "/v1/images/omni-image", process.env.KLING_API_KEY, "Kling", { method: "POST", body: JSON.stringify(request) });
+    const response = await providerFetch(BAILIAN_API_BASE, "/api/v1/services/aigc/image-generation/generation", process.env.BAILIAN_API_KEY, "阿里云百炼 Kling", { method: "POST", headers: { "X-DashScope-Async": "enable" }, body: JSON.stringify(request) });
     task.taskId = taskId(response);
     task.lastResponse = response;
-    task.status = response?.data?.task_status || response?.data?.status || "PENDING";
-    run.billing.kling = mergeUsage(run.billing.kling, response, "kling", null);
-    if (!task.taskId) throw new HttpError(502, `Kling 第 ${index + 1} 张关键帧响应中没有任务 ID`, response);
+    task.status = response?.output?.task_status || response?.data?.task_status || response?.data?.status || "PENDING";
+    run.billing.kling = mergeUsage(run.billing.kling, response, "aliyun-bailian-kling", "CNY");
+    if (!task.taskId) throw new HttpError(502, `阿里云百炼第 ${index + 1} 张关键帧响应中没有任务 ID`, response);
   }
   return task;
 }
@@ -558,7 +565,7 @@ async function createVideoVariant(source, videoPrompt, duration, resolution, vid
     derivedFromRunId: source.id,
     lineage: { type: "video_rerun", sourceRunId: source.id, reusedEditedImage: videoMode === "first_frame", reusedEditedKeyframes: videoMode === "multi_keyframes", sourceImageTaskId: source.imageTaskId || null },
     status: "submitting", stage: "video", message: videoMode === "reference_video" ? "已复用参考素材，准备重新提交 Kling 3.0 Omni" : videoMode === "multi_keyframes" ? "已复用替换关键帧，准备提交 H3" : "已复用替换首帧，准备提交 H3", createdAt: now, updatedAt: now,
-    imageModel: videoMode === "reference_video" ? null : source.imageModel || KLING_IMAGE_MODEL, videoModel,
+    imageModel: videoMode === "reference_video" ? null : source.imageModel || BAILIAN_IMAGE_MODEL, videoModel,
     imagePrompt: source.imagePrompt || null, videoPrompt, resolution, duration, ratio: source.ratio || "9:16", videoMode, publicBaseUrl: source.publicBaseUrl || null, audioMode: source.audioMode || "voice", voiceSource: source.voiceSource || "source_video", voiceScript: source.voiceScript || "",
     estimatedVideoCostCny, sourceVideo, productImage, voiceAudio, firstFrame, editedImage, keyframes, editedKeyframes, keyframeTimes: source.keyframeTimes || [], imageTasks: [], output: null,
     imageTaskId: videoMode === "reference_video" ? null : source.imageTaskId || null, imageStatus: videoMode === "reference_video" ? "SKIPPED" : "SUCCEEDED", imageReused: videoMode !== "reference_video",
@@ -614,14 +621,14 @@ async function refreshRun(run, { force = false } = {}) {
     if (run.videoMode === "multi_keyframes") {
       for (const task of run.imageTasks || []) {
         if (normalized(task.status) === "succeeded" || (!force && normalized(task.status) === "failed")) continue;
-        const response = await providerFetch(KLING_API_BASE, `/v1/images/omni-image/${encodeURIComponent(task.taskId)}`, process.env.KLING_API_KEY, "Kling");
+        const response = await providerFetch(BAILIAN_API_BASE, `/api/v1/tasks/${encodeURIComponent(task.taskId)}`, process.env.BAILIAN_API_KEY, "阿里云百炼 Kling");
         task.lastResponse = response;
-        task.status = response?.data?.task_status || response?.data?.status || "PENDING";
+        task.status = response?.output?.task_status || response?.data?.task_status || response?.data?.status || "PENDING";
         run.imageLastResponse = response;
-        run.billing.kling = mergeUsage(run.billing.kling, response, "kling", null);
+        run.billing.kling = mergeUsage(run.billing.kling, response, "aliyun-bailian-kling", "CNY");
         if (normalized(task.status) === "succeeded") {
-          const url = klingImageResult(response);
-          if (!url) throw new HttpError(502, `Kling 第 ${task.index + 1} 张关键帧成功但没有图片 URL`, response);
+          const url = bailianImageResult(response);
+          if (!url) throw new HttpError(502, `阿里云百炼第 ${task.index + 1} 张关键帧成功但没有图片 URL`, response);
           task.editedImage = await archiveRemote(run, url, "image", "kling-output", `edited-keyframe-${task.index + 1}`);
         }
       }
@@ -642,28 +649,28 @@ async function refreshRun(run, { force = false } = {}) {
         run.imageStatus = "PROCESSING";
         run.status = "PROCESSING";
         const completed = run.imageTasks.filter((task) => normalized(task.status) === "succeeded").length;
-        run.message = `Kling 正在替换关键帧（${completed}/${run.imageTasks.length}）`;
+        run.message = `正在替换关键帧（${completed}/${run.imageTasks.length}）`;
       }
     } else {
-      const response = await providerFetch(KLING_API_BASE, `/v1/images/omni-image/${encodeURIComponent(run.imageTaskId)}`, process.env.KLING_API_KEY, "Kling");
+      const response = await providerFetch(BAILIAN_API_BASE, `/api/v1/tasks/${encodeURIComponent(run.imageTaskId)}`, process.env.BAILIAN_API_KEY, "阿里云百炼 Kling");
       run.imageLastResponse = response;
-      run.billing.kling = mergeUsage(run.billing.kling, response, "kling", null);
-      run.imageStatus = response?.data?.task_status || response?.data?.status || "PENDING";
+      run.billing.kling = mergeUsage(run.billing.kling, response, "aliyun-bailian-kling", "CNY");
+      run.imageStatus = response?.output?.task_status || response?.data?.task_status || response?.data?.status || "PENDING";
       const status = normalized(run.imageStatus);
       if (status === "succeeded") {
-        const url = klingImageResult(response);
-        if (!url) throw new HttpError(502, "Kling 图片任务成功但没有图片 URL", response);
+        const url = bailianImageResult(response);
+        if (!url) throw new HttpError(502, "阿里云百炼图片任务成功但没有图片 URL", response);
         run.editedImage = await archiveRemote(run, url, "image", "kling-output", "edited-first-frame");
         run.status = "SUCCEEDED";
         run.message = "替换首帧已归档，请确认后启动 H3";
         finishStageTiming(run, "image");
       } else if (status === "failed") {
         run.status = "FAILED";
-        run.message = response?.data?.task_status_msg || response?.message || "Kling 图片任务失败";
+        run.message = response?.output?.message || response?.data?.task_status_msg || response?.message || "阿里云百炼图片任务失败";
         finishStageTiming(run, "image");
       } else {
         run.status = "PROCESSING";
-        run.message = "Kling Image O1 正在替换商品";
+        run.message = "正在替换商品";
       }
     }
   } else {
@@ -745,11 +752,12 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     if (req.method === "GET" && url.pathname === "/api/health") return sendJson(res, 200, { ok: true, service: "kling-h3-route-b", version: "0.1.0" });
     if (req.method === "GET" && url.pathname === "/api/config") return sendJson(res, 200, {
-      configured: MOCK || Boolean(process.env.KLING_API_KEY && process.env.XINHANKR_API_KEY),
+      configured: MOCK || Boolean(process.env.BAILIAN_API_KEY && process.env.XINHANKR_API_KEY),
       klingConfigured: MOCK || Boolean(process.env.KLING_API_KEY),
+      imageConfigured: MOCK || Boolean(process.env.BAILIAN_API_KEY),
       h3Configured: MOCK || Boolean(process.env.XINHANKR_API_KEY),
       mock: MOCK,
-      imageModel: KLING_IMAGE_MODEL,
+      imageModel: BAILIAN_IMAGE_MODEL,
       videoModel: H3_OPEN_MODEL,
       referenceVideoModel: KLING_VIDEO_OMNI_MODEL
     });
@@ -821,8 +829,8 @@ const server = http.createServer(async (req, res) => {
         ? requireMedia(body.voiceAudioId, "audio/", "声音样本")
         : null;
       Object.assign(run, {
-        status: "submitting", stage: videoMode === "reference_video" ? "video" : "image", message: videoMode === "reference_video" ? "准备提交 Kling 3.0 Omni 参考视频任务" : videoMode === "multi_keyframes" ? "准备提交多张关键帧替换任务" : "准备提交 Kling Image O1", updatedAt: new Date().toISOString(),
-        imageModel: videoMode === "reference_video" ? null : KLING_IMAGE_MODEL, videoModel, imagePrompt, videoPrompt, resolution, duration, ratio: videoMode === "reference_video" ? "adaptive" : "9:16", videoMode, publicBaseUrl, audioMode, voiceSource, voiceScript,
+        status: "submitting", stage: videoMode === "reference_video" ? "video" : "image", message: videoMode === "reference_video" ? "准备提交 Kling 3.0 Omni 参考视频任务" : videoMode === "multi_keyframes" ? "准备提交多张关键帧替换任务" : "准备提交商品替换任务", updatedAt: new Date().toISOString(),
+        imageModel: videoMode === "reference_video" ? null : BAILIAN_IMAGE_MODEL, videoModel, imagePrompt, videoPrompt, resolution, duration, ratio: videoMode === "reference_video" ? "adaptive" : "9:16", videoMode, publicBaseUrl, audioMode, voiceSource, voiceScript,
         estimatedVideoCostCny: estimatedH3Cost(duration, resolution, videoModel),
         sourceVideo,
         productImage: requireMedia(body.productImageId, "image/", "商品图片"),
@@ -979,7 +987,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`Kling Image O1 -> MiniMax H3: http://127.0.0.1:${PORT}`);
+  console.log(`阿里云百炼 Kling Image -> MiniMax H3: http://127.0.0.1:${PORT}`);
   console.log(MOCK ? "Mode: mock" : "Mode: live");
 });
 
