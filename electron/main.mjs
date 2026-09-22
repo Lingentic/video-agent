@@ -1,13 +1,15 @@
-import { app, BrowserWindow, Menu, ipcMain, shell } from "electron";
+import { app, BrowserWindow, Menu, dialog, ipcMain, shell } from "electron";
 import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync, openAsBlob } from "node:fs";
-import { copyFile, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const productName = "章域·视频混剪智能体";
+app.setName(productName);
 
 if (app.isPackaged) {
   const packagedUserData = path.join(app.getPath("appData"), "zhangyu-ai-video-client");
@@ -18,7 +20,7 @@ if (app.isPackaged) {
 const rootDir = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(rootDir, "..");
 const resourceRoot = app.isPackaged ? process.resourcesPath : projectRoot;
-const clientDataRoot = path.resolve(process.env.CLIENT_DATA_DIR || (app.isPackaged ? path.join(app.getPath("videos"), "章域 AI") : path.join(projectRoot, "client-data")));
+const clientDataRoot = path.resolve(process.env.CLIENT_DATA_DIR || (app.isPackaged ? path.join(app.getPath("videos"), productName) : path.join(projectRoot, "client-data")));
 const shotRunsDir = path.join(clientDataRoot, "video-shot", "runs-v1");
 const klingRunsDir = path.join(clientDataRoot, "kling-h3", "runs");
 const voiceDataRoot = path.join(clientDataRoot, "voices");
@@ -51,6 +53,8 @@ const serviceDefinitions = {
 const services = new Map();
 let mainWindow;
 let stopping = false;
+const quickTunnelMaxAttempts = 4;
+const quickTunnelRetryDelaysMs = [0, 1200, 2400, 4000];
 
 function findFreePort() {
   return new Promise((resolve, reject) => {
@@ -68,7 +72,8 @@ async function waitForHealth(baseUrl, healthPath, timeoutMs = 10000) {
   let lastError = "服务尚未响应";
   while (Date.now() - startedAt < timeoutMs) {
     try {
-      const response = await fetch(`${baseUrl}${healthPath}`);
+      const remainingMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
+      const response = await fetch(`${baseUrl}${healthPath}`, { signal: AbortSignal.timeout(Math.min(2500, remainingMs)) });
       if (response.ok) return await response.json();
       lastError = `HTTP ${response.status}`;
     } catch (error) {
@@ -107,7 +112,8 @@ function cloudflaredCommand() {
 }
 
 function startQuickTunnel(service, timeoutMs = 45000) {
-  const child = spawn(cloudflaredCommand(), ["tunnel", "--no-autoupdate", "--protocol", "http2", "--url", `http://127.0.0.1:${service.port}`], {
+  const startedAt = Date.now();
+  const child = spawn(cloudflaredCommand(), ["tunnel", "--no-autoupdate", "--url", `http://127.0.0.1:${service.port}`], {
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -117,13 +123,27 @@ function startQuickTunnel(service, timeoutMs = 45000) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let verifying = false;
+    let registered = false;
+    let discoveredUrl = null;
     let output = "";
+    let warmupTimer = null;
     const timer = setTimeout(() => finish(new Error("Cloudflare Quick Tunnel 启动超时")), timeoutMs);
     const finish = (error, url) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (warmupTimer) clearTimeout(warmupTimer);
       if (error) reject(error); else resolve(url);
+    };
+    const verifyWhenReady = () => {
+      if (!discoveredUrl || !registered || verifying || settled) return;
+      verifying = true;
+      service.tunnelUrl = discoveredUrl;
+      warmupTimer = setTimeout(() => {
+        warmupTimer = null;
+        const remainingMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
+        void waitForHealth(discoveredUrl, service.definition.healthPath, remainingMs).then(() => finish(null, discoveredUrl), finish);
+      }, 2000);
     };
     const capture = (chunk) => {
       const text = String(chunk);
@@ -131,10 +151,9 @@ function startQuickTunnel(service, timeoutMs = 45000) {
       service.output.push(`[tunnel] ${text.trim()}`);
       service.output = service.output.slice(-80);
       const match = output.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
-      if (!match || verifying) return;
-      verifying = true;
-      service.tunnelUrl = match[0].replace(/\/$/, "");
-      void waitForHealth(service.tunnelUrl, service.definition.healthPath, timeoutMs).then(() => finish(null, service.tunnelUrl), finish);
+      if (match) discoveredUrl = match[0].replace(/\/$/, "");
+      if (/Registered tunnel connection/i.test(output)) registered = true;
+      verifyWhenReady();
     };
     child.stdout.on("data", capture);
     child.stderr.on("data", capture);
@@ -142,6 +161,7 @@ function startQuickTunnel(service, timeoutMs = 45000) {
     child.once("exit", (code, signal) => {
       if (!settled) return finish(new Error(`Cloudflare Quick Tunnel 退出：code=${code ?? "null"}, signal=${signal ?? "null"}`));
       if (stopping) return;
+      if (service.tunnelChild !== child) return;
       service.tunnelUrl = null;
       service.tunnelError = "Cloudflare Quick Tunnel 已停止";
       notifyStatus();
@@ -149,22 +169,66 @@ function startQuickTunnel(service, timeoutMs = 45000) {
   });
 }
 
-async function ensureQuickTunnel(service) {
-  if (service.tunnelUrl && service.tunnelChild?.exitCode === null) return service.tunnelUrl;
-  if (service.tunnelPromise) return service.tunnelPromise;
-  service.tunnelPromise = (async () => {
-    try {
-      return await startQuickTunnel(service);
-    } catch (error) {
-      service.tunnelUrl = null;
-      service.tunnelError = error.message;
-      await stopChild(service.tunnelChild);
-      throw error;
-    } finally {
-      service.tunnelPromise = null;
+async function runQuickTunnelRound(service) {
+    if (service.tunnelUrl && service.tunnelChild?.exitCode === null) {
+      try {
+        await waitForHealth(service.tunnelUrl, service.definition.healthPath, 8000);
+        service.tunnelError = null;
+        return service.tunnelUrl;
+      } catch (error) {
+        service.output.push(`[tunnel] 已有通道失效，准备重建：${error.message}`);
+        service.output = service.output.slice(-80);
+        const staleChild = service.tunnelChild;
+        service.tunnelUrl = null;
+        await stopChild(staleChild);
+        if (service.tunnelChild === staleChild) service.tunnelChild = null;
+      }
     }
-  })();
-  return service.tunnelPromise;
+    let lastError = null;
+    for (let attempt = 1; attempt <= quickTunnelMaxAttempts; attempt += 1) {
+      const delayMs = quickTunnelRetryDelaysMs[attempt - 1] || 0;
+      if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      try {
+        return await startQuickTunnel(service);
+      } catch (error) {
+        lastError = error;
+        service.output.push(`[tunnel] 第 ${attempt}/${quickTunnelMaxAttempts} 次连接失败：${error.message}`);
+        service.output = service.output.slice(-80);
+        const failedChild = service.tunnelChild;
+        service.tunnelUrl = null;
+        await stopChild(failedChild);
+        if (service.tunnelChild === failedChild) service.tunnelChild = null;
+      }
+    }
+    const friendlyError = new Error("网络通道暂时未连接成功，请再试一次。尚未提交生成任务，不会产生费用。");
+    friendlyError.cause = lastError;
+    try {
+      service.tunnelUrl = null;
+      service.tunnelError = friendlyError.message;
+      throw friendlyError;
+    } finally {
+      notifyStatus();
+    }
+}
+
+async function ensureQuickTunnel(service, { freshAttemptsAfterSharedFailure = true } = {}) {
+  const sharedRound = service.tunnelPromise;
+  if (sharedRound) {
+    try {
+      return await sharedRound;
+    } catch (error) {
+      if (!freshAttemptsAfterSharedFailure) throw error;
+      service.output.push("[tunnel] 启动预热未成功，当前生成操作开始独立重试");
+      service.output = service.output.slice(-80);
+    }
+  }
+  if (service.tunnelPromise) return await service.tunnelPromise;
+  const round = runQuickTunnelRound(service);
+  const trackedRound = round.finally(() => {
+    if (service.tunnelPromise === trackedRound) service.tunnelPromise = null;
+  });
+  service.tunnelPromise = trackedRound;
+  return await trackedRound;
 }
 
 function getReadyShotService() {
@@ -431,6 +495,19 @@ async function listKlingAssets() {
   };
 }
 
+async function getLatestRecoverableKlingRun() {
+  const response = await klingRequest("api/runs");
+  const run = (response.runs || []).find((entry) => {
+    const status = String(entry.status || "").toUpperCase();
+    return entry.stage === "video"
+      && status !== "SUCCEEDED"
+      && !entry.output?.url
+      && Array.isArray(entry.editedKeyframes)
+      && entry.editedKeyframes.length > 0;
+  }) || null;
+  return { run, baseUrl: response.baseUrl };
+}
+
 async function readEnvValue(filePath, key) {
   try {
     const line = (await readFile(filePath, "utf8")).split(/\r?\n/).find((value) => value.trim().startsWith(`${key}=`));
@@ -644,18 +721,62 @@ async function createShotRun({ filePath, workflow, keepAudio = true }) {
   return shotRequest("api/runs", { method: "POST", body: form });
 }
 
-async function createShotBatch({ filePaths, workflow, keepAudio = true }) {
-  if (!Array.isArray(filePaths) || filePaths.length < 2 || filePaths.length > 25 || filePaths.some((filePath) => !filePath || typeof filePath !== "string")) throw new Error("批量处理需要选择 2–25 个视频");
+async function createShotBatch({ entries, filePaths, workflow, keepAudio = true }) {
+  const normalizedEntries = Array.isArray(entries) && entries.length
+    ? entries.map((entry) => typeof entry === "string" ? { path: entry } : entry)
+    : (Array.isArray(filePaths) ? filePaths.map((filePath) => ({ path: filePath })) : []);
+  if (normalizedEntries.length < 1 || normalizedEntries.length > 25 || normalizedEntries.some((entry) => !entry?.path || typeof entry.path !== "string")) throw new Error("批量处理需要选择 1–25 个视频");
   const selectedWorkflow = workflow === "ffmpeg_gemini_naming" ? workflow : "ffmpeg_only";
   if (selectedWorkflow === "ffmpeg_gemini_naming") {
     const config = await shotRequest("api/config");
     if (!config.apiKeyConfigured) throw new Error("命名服务未配置");
   }
   const form = new FormData();
-  for (const filePath of filePaths) form.append("videos", await openAsBlob(filePath), path.basename(filePath));
+  for (const entry of normalizedEntries) form.append("videos", await openAsBlob(entry.path), path.basename(entry.path));
+  form.append("folderManifest", JSON.stringify(normalizedEntries.map((entry) => ({
+    sourceFolderId: entry.folderId || null,
+    sourceFolderName: entry.folderName || null,
+    sourceRelativePath: entry.relativePath || path.basename(entry.path)
+  }))));
   form.append("workflow", selectedWorkflow);
   form.append("keepAudio", keepAudio === false ? "off" : "on");
   return shotRequest("api/batches", { method: "POST", body: form });
+}
+
+const shotVideoExtensions = new Set([".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"]);
+
+async function collectShotFolderVideos(folderPath) {
+  const videos = [];
+  const walk = async (currentPath) => {
+    const entries = await readdir(currentPath, { withFileTypes: true });
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name, "zh-CN", { numeric: true }))) {
+      const fullPath = path.join(currentPath, entry.name);
+      if (entry.isDirectory()) await walk(fullPath);
+      else if (entry.isFile() && shotVideoExtensions.has(path.extname(entry.name).toLowerCase())) videos.push(fullPath);
+    }
+  };
+  await walk(folderPath);
+  return videos;
+}
+
+async function pickShotFolders() {
+  const selection = await dialog.showOpenDialog(mainWindow, {
+    title: "选择商品素材文件夹",
+    properties: ["openDirectory", "multiSelections"]
+  });
+  if (selection.canceled || !selection.filePaths.length) return { folders: [], entries: [] };
+  const folders = [];
+  const entries = [];
+  for (const [folderIndex, folderPath] of selection.filePaths.entries()) {
+    const folderName = path.basename(folderPath);
+    const folderId = `folder_${folderIndex + 1}_${Buffer.from(folderPath).toString("base64url").slice(-10)}`;
+    const videos = await collectShotFolderVideos(folderPath);
+    folders.push({ id: folderId, name: folderName, path: folderPath, videoCount: videos.length });
+    for (const videoPath of videos) entries.push({ path: videoPath, name: path.basename(videoPath), sizeBytes: (await stat(videoPath)).size, folderId, folderName, relativePath: path.relative(folderPath, videoPath) });
+  }
+  if (!entries.length) throw new Error("所选文件夹中没有可处理的视频");
+  if (entries.length > 25) throw new Error(`共找到 ${entries.length} 个视频，单次最多处理 25 个`);
+  return { folders, entries };
 }
 
 async function listShotAssets() {
@@ -775,11 +896,10 @@ async function startService(key) {
     service.status = "ready";
     notifyStatus();
     if (key === "kling") {
-      void ensureQuickTunnel(service).then(notifyStatus).catch(async (error) => {
+      void ensureQuickTunnel(service, { freshAttemptsAfterSharedFailure: false }).then(notifyStatus).catch((error) => {
         service.tunnelError = error.message;
         service.tunnelUrl = null;
         service.output.push(`[tunnel] ${error.message}`);
-        await stopChild(service.tunnelChild);
         notifyStatus();
       });
     }
@@ -828,7 +948,7 @@ async function openWorkspace(key) {
   if (!service || service.status !== "ready") throw new Error(`${serviceDefinitions[key]?.label || key} 尚未就绪`);
   if (!mainWindow || mainWindow.isDestroyed()) throw new Error("主窗口不可用");
   await mainWindow.loadURL(serviceUrl(service));
-  mainWindow.setTitle(`视频工作台 · ${service.definition.label}`);
+  mainWindow.setTitle(`${productName} · ${service.definition.label}`);
 }
 
 function createMainWindow() {
@@ -837,7 +957,8 @@ function createMainWindow() {
     height: 760,
     minWidth: 900,
     minHeight: 620,
-    title: "视频工作台",
+    title: productName,
+    icon: path.join(rootDir, "renderer", "assets", "zhangyu-video-agent-icon.ico"),
     webPreferences: {
       preload: path.join(rootDir, "preload.cjs"),
       contextIsolation: true,
@@ -853,7 +974,7 @@ function createMainWindow() {
   mainWindow.webContents.on("before-input-event", (event, input) => {
     if (input.type === "keyDown" && input.control && input.shift && input.key.toUpperCase() === "H") {
       event.preventDefault();
-      void loadRenderer().then(() => mainWindow.setTitle("视频工作台"));
+      void loadRenderer().then(() => mainWindow.setTitle(productName));
     }
   });
   return loadRenderer();
@@ -875,6 +996,7 @@ ipcMain.handle("start-services", async () => {
 ipcMain.handle("open-workspace", (_event, key) => openWorkspace(key));
 ipcMain.handle("kling-get-config", () => getKlingConfig());
 ipcMain.handle("kling-list-assets", () => listKlingAssets());
+ipcMain.handle("kling-get-latest-recoverable", () => getLatestRecoverableKlingRun());
 ipcMain.handle("kling-create-run", (_event, payload) => createKlingRun(payload || {}));
 ipcMain.handle("kling-get-run", (_event, runId) => klingRequest(`api/runs/${encodeURIComponent(runId)}`));
 ipcMain.handle("kling-start-video", (_event, runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit, voiceEnabled) => startKlingVideo(runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit, voiceEnabled));
@@ -887,6 +1009,7 @@ ipcMain.handle("voice-delete", (_event, voiceId) => deleteVoice(voiceId));
 ipcMain.handle("voice-revoice-video", (_event, payload) => revoiceVideo(payload || {}));
 ipcMain.handle("shot-get-config", () => shotRequest("api/config"));
 ipcMain.handle("shot-list-assets", () => listShotAssets());
+ipcMain.handle("shot-pick-folders", () => pickShotFolders());
 ipcMain.handle("shot-create-run", (_event, payload) => createShotRun(payload || {}));
 ipcMain.handle("shot-create-batch", (_event, payload) => createShotBatch(payload || {}));
 ipcMain.handle("shot-get-run", (_event, runId) => shotRequest(`api/runs/${validateRunId(runId)}`));
@@ -897,7 +1020,7 @@ ipcMain.handle("shot-resume-batch", (_event, batchId) => shotRequest(`api/batche
 ipcMain.handle("shot-retry-batch-item", (_event, batchId, videoId) => shotRequest(`api/batches/${validateBatchId(batchId)}/items/${encodeURIComponent(videoId)}/retry`, { method: "POST" }));
 ipcMain.handle("go-home", () => {
   if (!mainWindow || mainWindow.isDestroyed()) throw new Error("主窗口不可用");
-  return loadRenderer().then(() => mainWindow.setTitle("视频工作台"));
+  return loadRenderer().then(() => mainWindow.setTitle(productName));
 });
 ipcMain.handle("open-logs", async () => {
   await mkdir(clientDataRoot, { recursive: true });
@@ -907,6 +1030,7 @@ ipcMain.handle("open-logs", async () => {
 });
 
 app.whenReady().then(async () => {
+  app.setAppUserModelId("ai.zhangyu.video-mix-agent");
   await createMainWindow();
   if (!uiPreviewMode) void startServices();
 });

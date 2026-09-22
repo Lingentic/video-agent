@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createNamingProfile } from "./naming-profile.mjs";
-import { createNamedFilename } from "./filename-service.mjs";
+import { createNamedFilename, createUniqueFilename } from "./filename-service.mjs";
 import { calculateCostYuan } from "./pricing.mjs";
 import { ffmpegPath } from "./runtime-paths.mjs";
 const execFileAsync = promisify(execFile);
@@ -119,8 +119,9 @@ export async function executeShotNaming({ runDir, initialRun, gemini, onStage })
   const labels = validateAndNormalizeLabels(raw, run.shots, run.durationSec, profile); await writeJson(path.join(artifactsDir, "shot_labels_raw.json"), raw); await writeJson(path.join(artifactsDir, "shot_labels_normalized.json"), labels);
   await stage("naming_export"); const namedDir = path.join(runDir, "named_segments"); await fsp.mkdir(namedDir, { recursive: true }); const manifest = [];
   const fps = Math.max(1, Number(run.fps || 30));
+  const usedFilenames = new Set();
   for (const [index, label] of labels.entries()) {
-    const filename = createNamedFilename(label, index, ".mp4");
+    const filename = createUniqueFilename(createNamedFilename(label, index, ".mp4"), usedFilenames);
     const output = path.join(namedDir, filename);
     const startFrame = Math.max(0, Math.round(label.startSec * fps));
     const endFrame = Math.max(startFrame + 1, Math.round(label.endSec * fps));

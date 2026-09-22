@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createNamedFilename, sanitizeFilenamePart } from "../src/filename-service.mjs";
+import { createNamedFilename, createUniqueFilename, sanitizeFilenamePart } from "../src/filename-service.mjs";
 import { validateAndNormalizeLabels } from "../src/naming-service.mjs";
 
 const shots = [
@@ -61,8 +61,15 @@ test("rejects empty titles and usage types outside the contract", () => {
   assert.throws(() => validateAndNormalizeLabels(badUsage, shots, 2, profileWithUsageEnum), /非法用途标签/);
 });
 
-test("creates a Windows-safe title and usage filename", () => {
+test("creates a Windows-safe descriptive filename without sequence or usage label", () => {
   const filename = createNamedFilename({ contentTitle: "杯盖:双饮口/展示", usageType: "功能讲解" }, 0, ".mp4");
-  assert.equal(filename, "001_杯盖 双饮口 展示_功能讲解.mp4");
+  assert.equal(filename, "杯盖 双饮口 展示.mp4");
   assert.equal(sanitizeFilenamePart("CON"), "CON_素材");
+});
+
+test("adds a suffix only when descriptive filenames collide", () => {
+  const used = new Set();
+  assert.equal(createUniqueFilename("主播展示杯盖.mp4", used), "主播展示杯盖.mp4");
+  assert.equal(createUniqueFilename("主播展示杯盖.mp4", used), "主播展示杯盖（2）.mp4");
+  assert.equal(createUniqueFilename("主播展示杯盖.mp4", used), "主播展示杯盖（3）.mp4");
 });

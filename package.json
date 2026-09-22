@@ -4,9 +4,9 @@
   "private": true,
   "description": "Electron shell for the Kling-H3 and video shot services",
   "author": {
-    "name": "章域 AI"
+    "name": "章域·视频混剪智能体"
   },
-  "copyright": "Copyright © 2026 章域 AI",
+  "copyright": "Copyright © 2026 章域·视频混剪智能体",
   "main": "electron/main.mjs",
   "type": "module",
   "scripts": {
@@ -21,9 +21,9 @@
     "electron-builder": "26.15.3"
   },
   "build": {
-    "appId": "ai.zhangyu.video-client",
-    "productName": "章域 AI",
-    "artifactName": "Zhangyu-AI-${version}-Setup.${ext}",
+    "appId": "ai.zhangyu.video-mix-agent",
+    "productName": "章域·视频混剪智能体",
+    "artifactName": "章域·视频混剪智能体-${version}-Setup.${ext}",
     "asar": true,
     "directories": {
       "output": "release"
@@ -73,7 +73,7 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "shortcutName": "章域 AI"
+      "shortcutName": "章域·视频混剪智能体"
     }
   }
 }

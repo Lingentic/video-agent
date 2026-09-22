@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld("videoClient", {
   openLogs: () => ipcRenderer.invoke("open-logs"),
   getKlingConfig: () => ipcRenderer.invoke("kling-get-config"),
   listKlingAssets: () => ipcRenderer.invoke("kling-list-assets"),
+  getLatestRecoverableKlingRun: () => ipcRenderer.invoke("kling-get-latest-recoverable"),
   createKlingRun: (videoFile, productFile, voiceScript, audioMode, videoMode, duration, voiceId) => ipcRenderer.invoke("kling-create-run", {
     videoPath: webUtils.getPathForFile(videoFile),
     productPath: webUtils.getPathForFile(productFile),
@@ -28,13 +29,14 @@ contextBridge.exposeInMainWorld("videoClient", {
   revoiceVideo: (videoUrl, runId, voiceId, text) => ipcRenderer.invoke("voice-revoice-video", { videoUrl, runId, voiceId, text }),
   getShotConfig: () => ipcRenderer.invoke("shot-get-config"),
   listShotAssets: () => ipcRenderer.invoke("shot-list-assets"),
+  pickShotFolders: () => ipcRenderer.invoke("shot-pick-folders"),
   createShotRun: (file, workflow, keepAudio) => ipcRenderer.invoke("shot-create-run", {
     filePath: webUtils.getPathForFile(file),
     workflow,
     keepAudio
   }),
-  createShotBatch: (files, workflow, keepAudio) => ipcRenderer.invoke("shot-create-batch", {
-    filePaths: files.map((file) => webUtils.getPathForFile(file)),
+  createShotBatch: (sources, workflow, keepAudio) => ipcRenderer.invoke("shot-create-batch", {
+    entries: sources.map((source) => source?.path ? source : { path: webUtils.getPathForFile(source?.file || source) }),
     workflow,
     keepAudio
   }),

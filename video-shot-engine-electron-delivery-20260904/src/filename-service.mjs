@@ -17,9 +17,20 @@ export function sanitizeFilenamePart(value, fallback = "待确认", maxLength = 
 }
 
 export function createNamedFilename(label, index, sourcePath) {
-  const sequence = String(index + 1).padStart(3, "0");
-  const title = sanitizeFilenamePart(label.contentTitle, "内容待确认", 24);
-  const shotType = sanitizeFilenamePart(label.usageType || label.recommendedUsages?.[0], "其他", 12);
+  const title = sanitizeFilenamePart(label.contentTitle, "内容待确认", 42);
   const extension = path.extname(sourcePath).toLowerCase() || ".mp4";
-  return `${sequence}_${title}_${shotType}${extension}`;
+  return `${title}${extension}`;
+}
+
+export function createUniqueFilename(filename, usedNames) {
+  const extension = path.extname(filename);
+  const stem = path.basename(filename, extension);
+  let candidate = filename;
+  let duplicateIndex = 2;
+  while (usedNames.has(candidate.toLocaleLowerCase("zh-CN"))) {
+    candidate = `${stem}（${duplicateIndex}）${extension}`;
+    duplicateIndex += 1;
+  }
+  usedNames.add(candidate.toLocaleLowerCase("zh-CN"));
+  return candidate;
 }
