@@ -31,6 +31,7 @@ release/
 
 # Bundled executables are too large for normal GitHub source storage
 packaging-resources/tools/**/*.exe
+packaging-resources/builtin-voices/*.wav
 wan3-video-demo/tools/
 
 # Old prototypes and unrelated local projects

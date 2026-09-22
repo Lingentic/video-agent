@@ -26,6 +26,15 @@ const klingRunsDir = path.join(clientDataRoot, "kling-h3", "runs");
 const voiceDataRoot = path.join(clientDataRoot, "voices");
 const voiceRegistryPath = path.join(voiceDataRoot, "voices.json");
 const revoicedOutputRoot = path.join(clientDataRoot, "kling-h3", "revoiced");
+const builtinVoiceResourceRoot = app.isPackaged ? path.join(resourceRoot, "builtin-voices") : path.join(projectRoot, "packaging-resources", "builtin-voices");
+const builtinVoices = [{
+  id: "qwen-audio-3.0-tts-plus-snail0918-ec843776a98841228ddfc50356086c82",
+  name: "老葛",
+  model: "qwen-audio-3.0-tts-plus",
+  createdAt: "2026-09-18T10:15:39+08:00",
+  duration: 14.721458,
+  resourceName: "laoge-reference.wav"
+}];
 const bundledFfmpegPath = path.join(resourceRoot, "tools", "ffmpeg", "ffmpeg.exe");
 const bundledFfprobePath = path.join(resourceRoot, "tools", "ffmpeg", "ffprobe.exe");
 const bundledCloudflaredPath = path.join(resourceRoot, "tools", "cloudflared", "cloudflared.exe");
@@ -548,9 +557,27 @@ function publicVoice(voice) {
     model: voice.model,
     createdAt: voice.createdAt,
     duration: voice.duration,
+    builtin: voice.builtin === true,
     demo: voice.demo === true,
     sampleUrl: voice.samplePath ? pathToFileURL(voice.samplePath).toString() : null
   };
+}
+
+async function ensureBuiltinVoices() {
+  await mkdir(voiceDataRoot, { recursive: true });
+  const voices = await readVoiceRegistry();
+  for (const definition of builtinVoices) {
+    const sourcePath = path.join(builtinVoiceResourceRoot, definition.resourceName);
+    if (!existsSync(sourcePath)) throw new Error(`内置音色资源缺失：${definition.resourceName}`);
+    const samplePath = path.join(voiceDataRoot, `builtin-${definition.resourceName}`);
+    if (!existsSync(samplePath)) await copyFile(sourcePath, samplePath);
+    const index = voices.findIndex((voice) => voice.id === definition.id);
+    const seededVoice = { ...definition, builtin: true, demo: false, samplePath };
+    delete seededVoice.resourceName;
+    if (index < 0) voices.unshift(seededVoice);
+    else voices[index] = { ...voices[index], ...seededVoice };
+  }
+  await writeVoiceRegistry(voices);
 }
 
 async function listVoices() {
@@ -621,6 +648,7 @@ async function deleteVoice(voiceId) {
   const voices = await readVoiceRegistry();
   const voice = voices.find((entry) => entry.id === voiceId);
   if (!voice) return { deleted: false };
+  if (voice.builtin === true) throw new Error("内置音色不能删除");
   if (voice.demo !== true) await dashscopeRequest("customization", { model: "voice-enrollment", input: { action: "delete_voice", voice_id: voice.id } });
   await writeVoiceRegistry(voices.filter((entry) => entry.id !== voice.id));
   if (voice.samplePath) await rm(voice.samplePath, { force: true });
@@ -1031,6 +1059,7 @@ ipcMain.handle("open-logs", async () => {
 
 app.whenReady().then(async () => {
   app.setAppUserModelId("ai.zhangyu.video-mix-agent");
+  await ensureBuiltinVoices();
   await createMainWindow();
   if (!uiPreviewMode) void startServices();
 });

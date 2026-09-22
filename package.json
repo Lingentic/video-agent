@@ -61,6 +61,13 @@
       {
         "from": "packaging-resources/tools",
         "to": "tools"
+      },
+      {
+        "from": "packaging-resources/builtin-voices",
+        "to": "builtin-voices",
+        "filter": [
+          "*.wav"
+        ]
       }
     ],
     "win": {

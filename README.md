@@ -79,3 +79,5 @@ packaging-resources/tools/cloudflared/cloudflared.exe
 ```
 
 再执行 `npm run pack:win`。安装包应放到 GitHub Releases 或其他制品存储，不要提交到源码分支。
+
+正式打包前还需要在本机准备 `packaging-resources/builtin-voices/laoge-reference.wav`。该文件会作为“老葛”内置音色样本进入安装包，但因声音授权与隐私原因被 Git 忽略，不会上传到源码仓库。
