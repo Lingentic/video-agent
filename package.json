@@ -1,6 +1,6 @@
 {
   "name": "video-client-electron",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "private": true,
   "description": "Electron shell for the Kling-H3 and video shot services",
   "author": {
@@ -25,6 +25,7 @@
     "productName": "章域·视频混剪智能体",
     "artifactName": "章域·视频混剪智能体-${version}-Setup.${ext}",
     "asar": true,
+    "forceCodeSigning": true,
     "directories": {
       "output": "release"
     },
@@ -74,7 +75,12 @@
       "icon": "build/icon.ico",
       "target": [
         "nsis"
-      ]
+      ],
+      "signExts": ["!cloudflared.exe"],
+      "signtoolOptions": {
+        "certificateSha1": "9B99E2046133A90005B842FFC0F03E8A13BFA834",
+        "signingHashAlgorithms": ["sha256"]
+      }
     },
     "nsis": {
       "oneClick": false,

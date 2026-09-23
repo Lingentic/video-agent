@@ -199,10 +199,12 @@
 .voice-delete-confirm > div button { min-height: 42px; border: 1px solid #dde0e5; border-radius: 10px; color: #5e626a; background: #fff; cursor: pointer; font-size: 10px; font-weight: 800; }
 .voice-delete-confirm > div button.is-danger { color: #fff; border-color: #b94a43; background: #b94a43; }
 .voice-delete-confirm > div button:disabled { opacity: .55; cursor: wait; }
-.voice-create-tile { height: 94px; min-height: 94px; display: flex; align-items: center; justify-content: center; gap: 13px; padding: 14px; border: 1px dashed #cbbdec; border-radius: 14px; color: #5c3aa9; background: #faf8ff; cursor: pointer; }
+.voice-create-tile { height: 94px; min-height: 94px; display: flex; align-items: center; justify-content: center; gap: 13px; padding: 14px; border: 1px dashed #cbbdec; border-radius: 14px; color: #5c3aa9; background: #faf8ff; cursor: pointer; transition: border-color 160ms ease, background 160ms ease, transform 160ms ease; }
+.voice-create-tile:hover { border-color: #8d6be4; background: #f3edff; transform: translateY(-2px); }
+.voice-create-tile:focus-visible { outline: 3px solid rgba(117, 79, 219, .22); outline-offset: 3px; }
 .voice-create-tile i { width: 44px; height: 44px; display: grid; place-items: center; flex: none; border-radius: 13px; color: #6845bf; background: #eee8fc; font-style: normal; }
 .voice-create-tile i svg { width: 25px; height: 25px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
-.voice-create-tile strong { font-size: 12px; font-weight: 850; }
+.voice-create-tile strong { font-size: 13px; font-weight: 850; }
 .voice-library-empty { grid-column: 1 / -1; min-height: 140px; display: grid; place-items: center; align-content: center; gap: 6px; color: var(--muted); text-align: center; }
 .voice-library-empty strong { color: var(--ink); font-size: 12px; }
 .voice-library-empty small { font-size: 9px; }
@@ -223,6 +225,27 @@
 .voice-create-actions { display: flex; justify-content: flex-end; gap: 9px; padding: 16px 24px 22px; border-top: 1px solid #eceef1; }
 .voice-create-actions button { min-width: 105px; padding: 10px 14px; border: 1px solid #dfe1e5; border-radius: 9px; background: #fff; cursor: pointer; font-size: 9px; font-weight: 800; }
 .voice-create-actions .primary { border-color: var(--lime); background: var(--lime); }
+.voice-create-dialog { width: min(580px, 100%); }
+.voice-create-body { display: grid; gap: 17px; padding: 24px; }
+.voice-create-hint { margin: 0; color: #62656f; font-size: 12px; line-height: 1.7; }
+.voice-create-hint strong { color: #30224f; }
+.voice-audio-upload { min-height: 112px; display: flex; align-items: center; gap: 16px; padding: 20px; border: 1.5px dashed #bda9ed; border-radius: 16px; color: #5c3aa9; background: #faf8ff; cursor: pointer; transition: border-color 160ms ease, background 160ms ease; }
+.voice-audio-upload:hover { border-color: #8260d7; background: #f5f0ff; }
+.voice-audio-upload:focus-visible { outline: 3px solid rgba(117, 79, 219, .22); outline-offset: 3px; }
+.voice-audio-upload > i { width: 54px; height: 54px; display: grid; place-items: center; flex: none; border-radius: 15px; color: #6845bf; background: #eee8fc; font-style: normal; }
+.voice-audio-upload svg { width: 27px; height: 27px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.voice-audio-upload span { min-width: 0; }
+.voice-audio-upload strong, .voice-audio-upload small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.voice-audio-upload strong { font-size: 15px; color: #24212d; }
+.voice-audio-upload small { margin-top: 7px; color: #777982; font-size: 11px; }
+.voice-create-body .voice-name-field { padding: 0; font-size: 12px; }
+.voice-create-body .voice-name-field input { height: 48px; font-size: 13px; }
+.voice-preview-note { display: flex; align-items: center; gap: 11px; padding: 12px 14px; border-radius: 11px; color: #635978; background: #f6f3fc; font-size: 11px; line-height: 1.5; }
+.voice-preview-note i { width: 24px; height: 24px; display: grid; place-items: center; flex: none; border-radius: 50%; color: #5635a7; background: #e9e0fa; font-size: 10px; font-style: normal; }
+.voice-create-error { margin: 0; color: #b9473d; font-size: 11px; line-height: 1.5; }
+.voice-create-dialog .voice-create-actions { padding: 16px 24px 22px; }
+.voice-create-dialog .voice-create-actions button { min-height: 46px; font-size: 11px; }
+.voice-create-dialog .voice-create-actions button:disabled { opacity: .52; cursor: not-allowed; }
 
 .voice-result-layout { width: fit-content; max-width: calc(100% - 40px); min-height: calc(100% - 108px); margin: 20px auto 24px; display: grid; grid-template-columns: auto 320px; gap: 12px; align-items: stretch; }
 .voice-result-preview { width: auto; max-width: 100%; height: min(666px, calc(100vh - 174px)); min-height: 0; aspect-ratio: 9 / 16; justify-self: center; align-self: start; display: grid; place-items: center; padding: 8px; overflow: hidden; border: 1px solid #e1e2e6; border-radius: 20px; background: #f6f7f8; }

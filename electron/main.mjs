@@ -527,6 +527,7 @@ async function readEnvValue(filePath, key) {
 
 const voiceTargetModel = "qwen-audio-3.0-tts-plus";
 const dashscopeApiBase = "https://dashscope.aliyuncs.com/api/v1/services/audio/tts";
+const voicePreviewText = "你好，这里是我的声音。希望接下来的作品，能带给你不一样的惊喜。";
 
 async function voiceApiKey() {
   const service = getReadyKlingService();
@@ -559,7 +560,8 @@ function publicVoice(voice) {
     duration: voice.duration,
     builtin: voice.builtin === true,
     demo: voice.demo === true,
-    sampleUrl: voice.samplePath ? pathToFileURL(voice.samplePath).toString() : null
+    hasGeneratedPreview: Boolean(voice.previewPath),
+    sampleUrl: voice.previewPath || voice.samplePath ? pathToFileURL(voice.previewPath || voice.samplePath).toString() : null
   };
 }
 
@@ -605,14 +607,16 @@ async function dashscopeRequest(pathname, payload) {
 }
 
 async function createVoice({ sourcePath, name }) {
-  if (!sourcePath) throw new Error("请先选择包含清晰人声的参考视频");
+  if (!sourcePath) throw new Error("请先上传一段参考音频");
   const duration = await videoDurationSeconds(sourcePath);
-  if (duration < 3) throw new Error("参考声音至少需要 3 秒");
+  if (duration < 8 || duration > 15) throw new Error("参考音频时长需在 8–15 秒之间");
   await mkdir(voiceDataRoot, { recursive: true });
   const localId = `voice_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
   const samplePath = path.join(voiceDataRoot, `${localId}.mp3`);
-  await execFileAsync(runtimeFfmpegPath, ["-y", "-i", sourcePath, "-map", "0:a:0", "-t", String(Math.min(30, duration)), "-vn", "-ac", "1", "-ar", "24000", "-c:a", "libmp3lame", "-b:a", "96k", samplePath], { windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+  const previewPath = path.join(voiceDataRoot, `${localId}-preview.wav`);
+  await execFileAsync(runtimeFfmpegPath, ["-y", "-i", sourcePath, "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "24000", "-c:a", "libmp3lame", "-b:a", "96k", samplePath], { windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
 
+  let voiceId = null;
   try {
     const { runId } = await klingRequest("api/run-id", { method: "POST" });
     const uploaded = await uploadKlingMedia(runId, samplePath, "audio", "inputs/voice-audio", `${localId}.mp3`);
@@ -631,15 +635,28 @@ async function createVoice({ sourcePath, name }) {
         enable_volume_normalization: "true"
       }
     });
-    const voiceId = response.output?.voice_id;
+    voiceId = response.output?.voice_id;
     if (!voiceId) throw new Error("声音服务没有返回音色 ID");
+    const previewResponse = await dashscopeRequest("SpeechSynthesizer", {
+      model: voiceTargetModel,
+      input: { text: voicePreviewText, voice: voiceId, format: "wav", sample_rate: 24000, rate: 1, pitch: 1, language_hints: ["zh"] }
+    });
+    const previewUrl = previewResponse.output?.audio?.url;
+    if (!previewUrl) throw new Error("声音服务没有返回试听音频");
+    const audioResponse = await fetch(previewUrl);
+    if (!audioResponse.ok) throw new Error("试听音频下载失败，请稍后重试");
+    await writeFile(previewPath, Buffer.from(await audioResponse.arrayBuffer()));
     const voices = await readVoiceRegistry();
-    const voice = { id: voiceId, name: String(name || "新建声音").trim().slice(0, 20) || "新建声音", model: voiceTargetModel, createdAt: new Date().toISOString(), duration: Math.min(30, duration), samplePath };
+    const voice = { id: voiceId, name: String(name || "新音色").trim().slice(0, 20) || "新音色", model: voiceTargetModel, createdAt: new Date().toISOString(), duration, samplePath, previewPath, previewText: voicePreviewText, enrollmentRequestId: response.request_id || null, previewRequestId: previewResponse.request_id || null };
     voices.unshift(voice);
     await writeVoiceRegistry(voices);
     return publicVoice(voice);
   } catch (error) {
     await rm(samplePath, { force: true });
+    await rm(previewPath, { force: true });
+    if (voiceId) {
+      try { await dashscopeRequest("customization", { model: "voice-enrollment", input: { action: "delete_voice", voice_id: voiceId } }); } catch {}
+    }
     throw error;
   }
 }
@@ -652,6 +669,7 @@ async function deleteVoice(voiceId) {
   if (voice.demo !== true) await dashscopeRequest("customization", { model: "voice-enrollment", input: { action: "delete_voice", voice_id: voice.id } });
   await writeVoiceRegistry(voices.filter((entry) => entry.id !== voice.id));
   if (voice.samplePath) await rm(voice.samplePath, { force: true });
+  if (voice.previewPath) await rm(voice.previewPath, { force: true });
   return { deleted: true };
 }
 

@@ -43,7 +43,7 @@ const tools = [
 ];
 const state = {
   active: "split",
-  remake: { products: [], reference: null, duration: 5, ratio: "9:16", resolution: "768P", videoMode: "multi_keyframes", audio: "voice", voiceEnabled: true, voiceScript: "", voiceDetected: null, voices: [], selectedVoiceId: null, voicePanel: null, voicePlayingId: null, revoicePending: false, voiceBusy: false, revoiceError: null, videoRetryConfirm: false, progress: 0, routeIndex: 0, stage: "", runId: null, serviceBaseUrl: "", editedImage: null, editedKeyframes: [], keyframeTimes: [], selectedRetryIndexes: [], imageReady: false, result: null, error: null, config: null, running: false },
+  remake: { products: [], reference: null, duration: 5, ratio: "9:16", resolution: "768P", videoMode: "multi_keyframes", audio: "voice", voiceEnabled: true, voiceScript: "", voiceDetected: null, voices: [], selectedVoiceId: null, voicePanel: null, voiceSource: null, voiceDraftName: "", voiceCreateError: "", voicePlayingId: null, revoicePending: false, voiceBusy: false, revoiceError: null, videoRetryConfirm: false, progress: 0, routeIndex: 0, stage: "", runId: null, serviceBaseUrl: "", editedImage: null, editedKeyframes: [], keyframeTimes: [], selectedRetryIndexes: [], imageReady: false, result: null, error: null, config: null, running: false },
   split: { source: null, sources: [], mode: "ffmpeg_only", keepAudio: true, progress: 0, routeIndex: 0, stage: "", runId: null, serviceBaseUrl: "", result: null, error: null, config: null, running: false, batch: null },
   audio: { source: null, script: "", progress: 0, result: null },
   compose: { script: "", ratio: "9:16", resolution: "1080P", progress: 0, result: null },
@@ -72,6 +72,13 @@ function friendlyRemakeError(error, stage = "video") {
   if (stage === "image") return "部分关键帧未能生成，请稍后重试对应图片。";
   if (stage === "voice") return "配音暂时未能生成，视频结果已经保留。";
   return "视频暂时未能生成，当前进度已经保留。";
+}
+function friendlyVoiceCreateError(error) {
+  const message = cleanRemoteError(error);
+  if (/8[–-]15|8 秒|15 秒|时长/i.test(message)) return "参考音频需要在 8–15 秒之间，请重新选择。";
+  if (/音轨|音频|格式|读取|codec|Invalid data/i.test(message)) return "这段音频无法使用，请换一段 MP3、WAV 或 M4A 音频。";
+  if (/fetch failed|网络|timeout|超时|ECONN|ENOTFOUND|TLS/i.test(message)) return "网络暂时不稳定，请稍后再试。";
+  return "音色暂时未能创建，请稍后再试。";
 }
 
 function notify(message) { toast.textContent = message; toast.classList.add("show"); clearTimeout(notify.timer); notify.timer = setTimeout(() => toast.classList.remove("show"), 1800); }
@@ -747,7 +754,7 @@ function remakeVoiceChoiceMarkup(item, voiceLocked = item.running) {
   const selectedVoice = item.voices.find((voice) => voice.id === item.selectedVoiceId) || null;
   return selectedVoice
     ? `<article class="selected-voice-card ${selectedVoice.demo ? "is-demo" : ""}"><button class="voice-play" data-action="voice-preview-play" data-voice-id="${esc(selectedVoice.id)}" type="button">${item.voicePlayingId === selectedVoice.id ? "Ⅱ" : "▶"}</button>${voiceFingerprint(3)}<span><strong>${esc(selectedVoice.name)}</strong></span><button class="voice-change" data-action="voice-open-picker" type="button" aria-label="更换音色" title="更换音色" ${voiceLocked ? "disabled" : ""}>${voiceChangeIcon()}</button></article>`
-    : `<div class="voice-empty-choice"><button data-action="voice-open-create" type="button" ${item.reference && item.voiceDetected?.hasAudio && !voiceLocked ? "" : "disabled"}><i>＋</i><span><strong>从视频创建</strong><small>${item.reference ? item.voiceDetected?.checking ? "正在检测人声" : item.voiceDetected?.hasAudio ? "提取当前视频人声" : "当前视频没有可用人声" : "请先上传参考视频"}</small></span></button><button data-action="voice-open-picker" type="button" ${(item.voices.length && !voiceLocked) ? "" : "disabled"}><i>⌁</i><span><strong>选择已有声音</strong><small>${item.voices.length ? `已有 ${item.voices.length} 个声音` : "暂无已保存声音"}</small></span></button></div>`;
+    : `<div class="voice-empty-choice"><button data-action="voice-open-create" type="button" ${voiceLocked ? "disabled" : ""}><i>＋</i><span><strong>创建新音色</strong><small>上传 8–15 秒参考音频</small></span></button><button data-action="voice-open-picker" type="button" ${(item.voices.length && !voiceLocked) ? "" : "disabled"}><i>⌁</i><span><strong>选择已有声音</strong><small>${item.voices.length ? `已有 ${item.voices.length} 个声音` : "暂无已保存声音"}</small></span></button></div>`;
 }
 
 function syncRemakeVoiceChoice() {
@@ -825,7 +832,7 @@ function voiceLibraryCardMarkup(item, voice, index, removeVoiceIcon) {
     ? "演示音色"
     : voice.builtin
       ? `内置音色${voice.duration ? ` · ${Number(voice.duration).toFixed(1)} 秒样本` : ""}`
-      : voice.duration ? `${Number(voice.duration).toFixed(1)} 秒样本` : "已保存音色";
+      : voice.hasGeneratedPreview ? "已生成试听音频" : voice.duration ? `${Number(voice.duration).toFixed(1)} 秒样本` : "已保存音色";
   const deleteControl = voice.builtin ? "" : `<button class="voice-library-delete" data-action="voice-delete" data-voice-id="${esc(voice.id)}" type="button" aria-label="删除${esc(voice.name)}">${removeVoiceIcon}</button>`;
   return `<article class="${selected ? "is-selected" : ""} ${voice.demo ? "is-demo" : ""} ${voice.builtin ? "is-builtin" : ""}"><button class="voice-library-play" data-action="voice-preview-play" data-voice-id="${esc(voice.id)}" type="button" aria-label="试听${esc(voice.name)}">${item.voicePlayingId === voice.id ? "Ⅱ" : "▶"}</button>${voiceFingerprint(index + 2)}<span><strong>${esc(voice.name)}</strong><small>${meta}</small></span><button class="voice-library-select" data-action="voice-select" data-voice-id="${esc(voice.id)}" type="button" aria-label="${selected ? "已选择" : "选择"}${esc(voice.name)}" aria-pressed="${selected}"><i aria-hidden="true">${selected ? "✓" : ""}</i></button><div class="voice-library-delete-slot">${deleteControl}</div></article>`;
 }
@@ -833,13 +840,14 @@ function voiceLibraryCardMarkup(item, voice, index, removeVoiceIcon) {
 function renderVoiceOverlay(item) {
   if (item.voicePanel === "picker") {
     const voices = item.voices || [];
-    const createIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m9.5 9 5 3-5 3z"/><path d="M17 2.5v5M14.5 5h5"/></svg>`;
+    const createIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M3 12h18"/><path d="M5 5h3M5 5v3M19 19h-3m3 0v-3"/></svg>`;
     const removeVoiceIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M7.10002 5H3C2.44772 5 2 5.44772 2 6C2 6.55228 2.44772 7 3 7H4.06055L4.88474 20.1871C4.98356 21.7682 6.29471 23 7.8789 23H16.1211C17.7053 23 19.0164 21.7682 19.1153 20.1871L19.9395 7H21C21.5523 7 22 6.55228 22 6C22 5.44772 21.5523 5 21 5H19.0073C19.0018 4.99995 18.9963 4.99995 18.9908 5H16.9C16.4367 2.71776 14.419 1 12 1C9.58104 1 7.56329 2.71776 7.10002 5ZM9.17071 5H14.8293C14.4175 3.83481 13.3062 3 12 3C10.6938 3 9.58254 3.83481 9.17071 5ZM17.9355 7H6.06445L6.88085 20.0624C6.91379 20.5894 7.35084 21 7.8789 21H16.1211C16.6492 21 17.0862 20.5894 17.1192 20.0624L17.9355 7ZM14.279 10.0097C14.83 10.0483 15.2454 10.5261 15.2068 11.0771L14.7883 17.0624C14.7498 17.6134 14.2719 18.0288 13.721 17.9903C13.17 17.9517 12.7546 17.4739 12.7932 16.9229L13.2117 10.9376C13.2502 10.3866 13.7281 9.97122 14.279 10.0097ZM9.721 10.0098C10.2719 9.97125 10.7498 10.3866 10.7883 10.9376L11.2069 16.923C11.2454 17.4739 10.83 17.9518 10.2791 17.9903C9.72811 18.0288 9.25026 17.6134 9.21173 17.0625L8.79319 11.0771C8.75467 10.5262 9.17006 10.0483 9.721 10.0098Z"/></svg>`;
-    return `<div class="voice-overlay" data-action="voice-close-panel"><section class="voice-dialog" role="dialog" aria-modal="true" aria-label="选择音色"><header><span><small>声音库</small><h2>选择一个音色</h2></span><button data-action="voice-close-panel" type="button" aria-label="关闭">×</button></header><div class="voice-library-grid">${voices.map((voice, index) => voiceLibraryCardMarkup(item, voice, index, removeVoiceIcon)).join("")}${item.reference ? `<button class="voice-create-tile" data-action="voice-open-create" type="button"><i>${createIcon}</i><strong>根据视频创建新音色</strong></button>` : ""}${voices.length || item.reference ? "" : `<div class="voice-library-empty"><strong>还没有可用音色</strong><small>请先上传参考视频，再从视频中创建音色。</small></div>`}</div></section></div>`;
+    return `<div class="voice-overlay" data-action="voice-close-panel"><section class="voice-dialog" role="dialog" aria-modal="true" aria-label="选择音色"><header><span><small>声音库</small><h2>选择一个音色</h2></span><button data-action="voice-close-panel" type="button" aria-label="关闭">×</button></header><div class="voice-library-grid">${voices.map((voice, index) => voiceLibraryCardMarkup(item, voice, index, removeVoiceIcon)).join("")}<button class="voice-create-tile" data-action="voice-open-create" type="button"><i>${createIcon}</i><strong>添加新音色</strong></button></div></section></div>`;
   }
   if (item.voicePanel === "create") {
-    const duration = item.voiceDetected?.duration;
-    return `<div class="voice-overlay" data-action="voice-close-panel"><section class="voice-dialog voice-create-dialog" role="dialog" aria-modal="true" aria-label="创建声音"><header><span><small>创建声音</small><h2>从当前视频提取</h2></span><button data-action="voice-close-panel" type="button" aria-label="关闭">×</button></header><div class="voice-source-audit"><div class="voice-source-audit__preview"><i>▶</i><span><strong>${esc(item.reference?.name || "参考视频中的人声")}</strong><small>${duration ? `将提取前 ${Math.min(30, Number(duration)).toFixed(1)} 秒清晰人声` : "将自动提取清晰人声"}</small></span></div><ul><li><i>✓</i>自动转换为单声道</li><li><i>✓</i>自动规整采样率</li><li><i>✓</i>自动进行降噪预处理</li></ul></div><label class="voice-name-field"><span>声音名称</span><input id="voiceNameInput" value="新建声音" maxlength="20" ${item.voiceBusy ? "disabled" : ""}></label><div class="voice-create-actions"><button data-action="voice-close-panel" type="button" ${item.voiceBusy ? "disabled" : ""}>取消</button><button class="primary" data-action="voice-create" type="button" ${item.voiceBusy ? "disabled" : ""}>${item.voiceBusy ? "正在创建…" : "创建声音"}</button></div></section></div>`;
+    const source = item.voiceSource;
+    const uploadIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0-4 4m4-4 4 4M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>`;
+    return `<div class="voice-overlay" data-action="voice-close-panel"><section class="voice-dialog voice-create-dialog" role="dialog" aria-modal="true" aria-label="创建新音色"><header><span><small>声音库 / 新建</small><h2>创建新音色</h2></span><button data-action="voice-close-panel" type="button" aria-label="关闭">×</button></header><div class="voice-create-body"><p class="voice-create-hint">上传一段 <strong>8–15 秒</strong>的音频，最好只有目标人物说话，没有背景音乐或其他人的声音。</p><label class="voice-audio-upload" for="voiceSourceInput" tabindex="0"><i>${uploadIcon}</i><span><strong>${esc(source?.name || "选择参考音频")}</strong><small>${source?.checking ? "正在检查时长…" : source?.duration ? `${Number(source.duration).toFixed(1)} 秒 · 点击更换文件` : "支持 MP3、WAV、M4A"}</small></span></label><input id="voiceSourceInput" type="file" accept="audio/mpeg,audio/wav,audio/mp4,.mp3,.wav,.m4a" ${item.voiceBusy ? "disabled" : ""} hidden><label class="voice-name-field"><span>音色名称</span><input id="voiceNameInput" value="${esc(item.voiceDraftName || "")}" placeholder="例如：我的声音" maxlength="20" ${item.voiceBusy ? "disabled" : ""}></label><div class="voice-preview-note"><i>▶</i><span>固定试听台词：“你好，这里是我的声音。希望接下来的作品，能带给你不一样的惊喜。”</span></div>${item.voiceCreateError ? `<p class="voice-create-error" role="alert">${esc(item.voiceCreateError)}</p>` : ""}</div><div class="voice-create-actions"><button data-action="voice-back-picker" type="button" ${item.voiceBusy ? "disabled" : ""}>返回声音库</button><button class="primary" data-action="voice-create" type="button" ${item.voiceBusy || !source?.file || source.checking || !(source.duration >= 8 && source.duration <= 15) ? "disabled" : ""}>${item.voiceBusy ? "正在创建音色和试听…" : "创建并生成试听"}</button></div></section></div>`;
   }
   return "";
 }
@@ -1268,12 +1276,17 @@ document.addEventListener("click", async (event) => {
   const action = event.target.closest("[data-action]")?.dataset.action;
   if (action === "voice-open-picker") { state.remake.revoicePending = false; replaceVoiceOverlay("picker"); return; }
   if (action === "voice-open-create") {
-    if (!state.remake.reference || !state.remake.voiceDetected?.hasAudio) { notify("请先选择包含清晰人声的参考视频"); return; }
     state.remake.revoicePending = false;
+    state.remake.voiceCreateError = "";
     replaceVoiceOverlay("create");
     return;
   }
+  if (action === "voice-back-picker") {
+    if (!state.remake.voiceBusy) replaceVoiceOverlay("picker");
+    return;
+  }
   if (action === "voice-close-panel") {
+    if (state.remake.voiceBusy) return;
     const target = event.target.closest("[data-action='voice-close-panel']");
     if (target?.classList.contains("voice-overlay") && event.target !== target) return;
     state.remake.revoicePending = false;
@@ -1325,22 +1338,29 @@ document.addEventListener("click", async (event) => {
     return;
   }
   if (action === "voice-create") {
-    if (state.remake.voiceBusy || !state.remake.reference?.file) return;
-    const name = document.querySelector("#voiceNameInput")?.value.trim() || "新建声音";
+    const source = state.remake.voiceSource;
+    if (state.remake.voiceBusy || !source?.file || source.checking) return;
+    if (!(source.duration >= 8 && source.duration <= 15)) { state.remake.voiceCreateError = "参考音频时长需在 8–15 秒之间"; replaceVoiceOverlay("create"); return; }
+    const name = document.querySelector("#voiceNameInput")?.value.trim() || "新音色";
+    state.remake.voiceDraftName = name;
+    state.remake.voiceCreateError = "";
     state.remake.voiceBusy = true;
     const createButton = event.target.closest("[data-action='voice-create']");
     const nameInput = workspace.querySelector("#voiceNameInput");
     if (createButton) { createButton.disabled = true; createButton.textContent = "正在创建…"; }
     if (nameInput) nameInput.disabled = true;
     try {
-      const voice = await videoClient.createVoice(state.remake.reference.file, name);
+      const voice = await videoClient.createVoice(source.file, name);
       state.remake.voices.unshift(voice);
       state.remake.selectedVoiceId = voice.id;
-      replaceVoiceOverlay(null);
+      state.remake.voiceSource = null;
+      state.remake.voiceDraftName = "";
+      replaceVoiceOverlay("picker");
       syncRemakeVoiceChoice();
-      notify("声音已创建并保存，可直接用于本次生成");
+      notify("新音色已创建，点击播放可试听效果");
     } catch (error) {
-      notify(`创建声音失败：${error.message}`);
+      console.error("创建音色失败", error);
+      state.remake.voiceCreateError = friendlyVoiceCreateError(error);
     } finally {
       state.remake.voiceBusy = false;
       if (state.remake.voicePanel === "create") replaceVoiceOverlay("create");
@@ -1526,7 +1546,14 @@ mediaViewer.addEventListener("close", () => {
   previewOpener?.focus();
   previewOpener = null;
 });
+document.addEventListener("keydown", (event) => {
+  if (event.target.matches(".voice-audio-upload") && (event.key === "Enter" || event.key === " ")) {
+    event.preventDefault();
+    document.querySelector("#voiceSourceInput")?.click();
+  }
+});
 document.addEventListener("input", (event) => {
+  if (event.target.id === "voiceNameInput") { state.remake.voiceDraftName = event.target.value; return; }
   if (event.target.id === "folderTaskSearch" && state.split.batch?.folderMode) {
     state.split.batch.folderQuery = event.target.value;
     const query = event.target.value.trim().toLowerCase();
@@ -1559,6 +1586,26 @@ document.addEventListener("input", (event) => {
 document.addEventListener("change", async (event) => {
   const files = [...(event.target.files || [])];
   if (!files.length) return;
+  if (event.target.id === "voiceSourceInput") {
+    const source = { file: files[0], name: files[0].name, checking: true, duration: null };
+    state.remake.voiceSource = source;
+    state.remake.voiceCreateError = "";
+    replaceVoiceOverlay("create");
+    try {
+      const info = await videoClient.inspectReferenceAudio(files[0]);
+      if (state.remake.voiceSource !== source) return;
+      if (!info.hasAudio || !Number.isFinite(Number(info.duration))) throw new Error("无法读取这段音频，请选择 MP3、WAV 或 M4A 文件");
+      source.duration = Number(info.duration);
+      if (source.duration < 8 || source.duration > 15) state.remake.voiceCreateError = "参考音频时长需在 8–15 秒之间";
+    } catch (error) {
+      if (state.remake.voiceSource !== source) return;
+      state.remake.voiceCreateError = friendlyVoiceCreateError(error);
+    } finally {
+      source.checking = false;
+      if (state.remake.voiceSource === source && state.remake.voicePanel === "create") replaceVoiceOverlay("create");
+    }
+    return;
+  }
   if (event.target.id === "productInput" || event.target.id === "referenceInput") {
     if (event.target.id === "productInput") state.remake.products = [addFile(files[0], "image", "产品替换")];
     else {
