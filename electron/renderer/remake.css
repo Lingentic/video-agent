@@ -194,3 +194,37 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+.network-retry-preview { min-height:520px; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:48px 24px; text-align:center; }
+.network-retry-symbol { display:grid; place-items:center; width:80px; height:80px; border-radius:24px; background:#f6f0eb; color:#ac7346; margin-bottom:24px; }
+.network-retry-symbol svg { width:38px; height:38px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
+.network-retry-preview h2 { font-size:28px; margin:0 0 12px; }
+.network-retry-preview p { font-size:17px; line-height:1.7; color:#737783; margin:0 0 28px; }
+.network-retry-preview .primary { display:flex; align-items:center; justify-content:center; gap:12px; width:210px; min-height:58px; border-radius:16px; font-size:20px; }
+.network-retry-preview button svg { width:24px; height:24px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+.network-retry-preview small { font-size:13px; color:#858894; margin-top:16px; }
+.network-retry-symbol.is-processing { background:#eee8ff; color:#7547dc; }
+.network-progress-ring { animation:network-ring-spin 1s linear infinite; }
+@keyframes network-ring-spin { to { transform:rotate(360deg); } }
+@media(prefers-reduced-motion:reduce){.network-progress-ring{animation:none}}
+@media(max-width:650px){.network-retry-preview{min-height:380px;padding:32px 16px}.network-retry-preview h2{font-size:24px}}
+
+.remake-stop-actions { display: flex; justify-content: flex-end; margin: 20px 0 0; }
+.remake-stop-actions--processing { justify-content: center; margin: 30px 0 0; }
+.remake-stop-actions--processing .remake-stop-trigger { color: #b84741; border-color: #e6b7b3; background: #fff7f6; }
+.remake-stop-actions--processing .remake-stop-trigger:hover:not(:disabled) { color: #a93530; border-color: #d9938e; background: #ffefed; }
+.product-subject-field { display: grid; gap: 8px; margin-top: 28px; }
+.product-subject-heading { display: flex; align-items: center; gap: 7px; }
+.product-subject-field label { display: flex; align-items: center; gap: 8px; color: #35333d; font-size: 13px; font-weight: 700; }
+.product-subject-field label small { padding: 2px 6px; border: 1px solid #e4dff0; border-radius: 999px; color: #898490; background: #f8f6fc; font-size: 11px; font-weight: 400; }
+.product-subject-help { width: 17px; height: 17px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%; color: #8a8593; background: transparent; cursor: help; }
+.product-subject-help svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.35; stroke-linecap: round; stroke-linejoin: round; }
+.product-subject-help:hover, .product-subject-help:focus-visible { color: #6042aa; }
+.product-subject-help:focus-visible { outline: 2px solid #d9cdf5; outline-offset: 2px; }
+.product-subject-tooltip { position: fixed; inset: auto; z-index: 1000; width: max-content; max-width: min(280px, calc(100vw - 24px)); margin: 0; padding: 10px 12px; border: 1px solid #e0d9ee; border-radius: 9px; color: #514b5c; background: #fff; box-shadow: 0 8px 24px rgba(38, 29, 57, .14); font-size: 11px; font-weight: 400; line-height: 1.55; white-space: normal; }
+.product-subject-field textarea { width: 100%; min-height: 70px; padding: 12px; border: 1px solid #dedce6; border-radius: 12px; background: #fff; color: #24232b; font: inherit; font-size: 13px; line-height: 1.6; resize: none; }
+.product-subject-field textarea:focus { outline: none; box-shadow: none; border-color: #a88ddd; }
+.product-subject-field textarea:disabled { background: #f6f5f9; color: #787380; }
+.remake-stop-trigger { min-height: 40px; padding: 0 16px; border: 1px solid #dfe1e6; border-radius: 10px; color: #737680; background: #fff; font-size: 12px; font-weight: 750; cursor: pointer; transition: color 160ms ease, border-color 160ms ease, background 160ms ease; }
+.remake-stop-trigger:hover:not(:disabled) { color: #b94a43; border-color: #d7a9a4; background: #fff6f5; }
+.remake-stop-trigger:focus-visible { outline: 3px solid #f2d9d6; outline-offset: 2px; }
+.remake-stop-trigger:disabled, .remake-stop-overlay button:disabled { opacity: .55; cursor: wait; }

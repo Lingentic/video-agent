@@ -15,9 +15,9 @@ export async function cleanupAnalysisInput(runDir) {
   try { await fsp.rm(path.join(runDir, "artifacts", "analysis_input_numbered.mp4"), { force: true }); } catch {}
 }
 
-export async function cleanupRunInputs(runDir, inputPath) {
+export async function cleanupRunInputs(runDir, inputPath, { preserveInput = false } = {}) {
   const safeInput = safePath(runDir, inputPath);
-  if (safeInput) try { await fsp.rm(safeInput, { force: true }); } catch {}
+  if (safeInput && !preserveInput) try { await fsp.rm(safeInput, { force: true }); } catch {}
   await cleanupAnalysisInput(runDir);
 }
 
@@ -56,7 +56,7 @@ export async function cleanupStaleInputs(runsDir, now = Date.now()) {
         continue;
       }
       if (run.status === "completed" || (["failed", "processing", "queued"].includes(run.status) && timestampOf(run) < cutoff)) {
-        await cleanupRunInputs(dir, run.input);
+        await cleanupRunInputs(dir, run.input, { preserveInput: run.removeSubtitles });
       }
       continue;
     }
@@ -70,7 +70,7 @@ export async function cleanupStaleInputs(runsDir, now = Date.now()) {
       const item = await readJson(itemDir, "item.json");
       if (!item) continue;
       if (item.status === "completed" || (["failed", "processing", "queued"].includes(item.status) && timestampOf(item) < cutoff)) {
-        await cleanupRunInputs(itemDir, item.input);
+        await cleanupRunInputs(itemDir, item.input, { preserveInput: item.removeSubtitles });
       }
     }
   }

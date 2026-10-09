@@ -1,10 +1,10 @@
 import http from "node:http";
 import { execFile } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { appendFile, copyFile, mkdir, open, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
-import { extname, join } from "node:path";
+import { appendFile, copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -19,6 +19,10 @@ const PUBLIC_DIR = process.env.PUBLIC_DIR ? join(process.env.PUBLIC_DIR) : join(
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 220 * 1024 * 1024);
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 60_000);
 const MOCK = /^true$/i.test(process.env.MOCK_PIPELINE || "");
+const WAW_API_BASE = (process.env.WAW_API_BASE || "https://wawapii.com/v1").replace(/\/$/, "");
+const WAW_IMAGE_MODEL = "gpt-image-2";
+const imageWorkers = new Set();
+const submissionClaims = new Set();
 const KLING_API_BASE = (process.env.KLING_API_BASE || "https://api-singapore.klingai.com").replace(/\/$/, "");
 const BAILIAN_API_BASE = (process.env.BAILIAN_API_BASE || "https://dashscope.aliyuncs.com").replace(/\/$/, "");
 const BAILIAN_IMAGE_MODEL = process.env.BAILIAN_IMAGE_MODEL || "kling/kling-v3-omni-image-generation";
@@ -26,6 +30,9 @@ const BAILIAN_IMAGE_RESOLUTION = process.env.BAILIAN_IMAGE_RESOLUTION || "1k";
 const KLING_VIDEO_OMNI_MODEL = process.env.KLING_VIDEO_OMNI_MODEL || "kling-3.0-omni";
 const H3_API_BASE = (process.env.XINHANKR_API_BASE || "https://token.xinhankr.com").replace(/\/$/, "");
 const H3_OPEN_MODEL = process.env.XINHANKR_H3_OPEN_MODEL || "MiniMax-H3";
+const AIMANPLAY_API_BASE = (process.env.AIMANPLAY_API_BASE || "https://aimanplay.cn").replace(/\/$/, "");
+const AIMANPLAY_VIDEO_MODEL = "minimax_h3_image_audio_to_video_v2_15s";
+const AIMANPLAY_VIDEO_RATE_CNY = 0.06;
 const FFMPEG_PATH = process.env.FFMPEG_PATH || "ffmpeg";
 const H3_OPEN_DISCOUNT = 0.35;
 const KLING_OMNI_PROMPT_MAX_BYTES = 3072;
@@ -33,14 +40,15 @@ const KLING_REFERENCE_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 const KLING_REFERENCE_VIDEO_MAX_BYTES = 200 * 1024 * 1024;
 
 function videoModelForMode(videoMode) {
-  return videoMode === "reference_video" ? KLING_VIDEO_OMNI_MODEL : H3_OPEN_MODEL;
+  return videoMode === "reference_video" ? KLING_VIDEO_OMNI_MODEL : videoMode === "multi_keyframes" ? AIMANPLAY_VIDEO_MODEL : H3_OPEN_MODEL;
 }
 
 function videoResolutionsForMode(videoMode) {
   return videoMode === "reference_video" ? ["720P", "1080P"] : ["768P"];
 }
 
-function estimatedH3Cost(duration, resolution, model) {
+function estimatedVideoCost(duration, resolution, model) {
+  if (model === AIMANPLAY_VIDEO_MODEL) return Number((duration * AIMANPLAY_VIDEO_RATE_CNY).toFixed(6));
   if (model !== "MiniMax-H3-open") return null;
   const baseRate = resolution === "480P" ? 0.3 : 0.5;
   return Number((duration * baseRate * H3_OPEN_DISCOUNT).toFixed(6));
@@ -50,6 +58,7 @@ await mkdir(RUNS_DIR, { recursive: true });
 const runs = new Map();
 const media = new Map();
 const runWriteQueues = new Map();
+const frameCleanupWorkers = new Map();
 await restoreRuns();
 
 function sendJson(res, status, payload) {
@@ -95,15 +104,17 @@ function allowedMedia(kind, mime, name) {
 }
 
 function publicMedia(item) {
-  return item ? { id: item.id, name: item.name, mime: item.mime, size: item.size, url: `/media/${item.id}/${encodeURIComponent(item.name)}` } : null;
+  return item && !item.localDeletedAt ? { id: item.id, name: item.name, mime: item.mime, size: item.size, url: `/media/${item.id}/${encodeURIComponent(item.name)}` } : null;
 }
 
 function publicRun(run) {
   ensureRunMetrics(run);
   return {
     ...run,
+    productSubject: run.productSubject || "",
     sourceVideo: publicMedia(run.sourceVideo),
     productImage: publicMedia(run.productImage),
+    productImages: run.productImages.map(publicMedia),
     voiceAudio: publicMedia(run.voiceAudio),
     firstFrame: publicMedia(run.firstFrame),
     editedImage: publicMedia(run.editedImage),
@@ -115,6 +126,8 @@ function publicRun(run) {
 }
 
 function ensureRunMetrics(run) {
+  run.productImages = Array.isArray(run.productImages) ? run.productImages : run.productImage ? [run.productImage] : [];
+  run.productImage = run.productImages[0] || null;
   run.timing ||= {};
   Object.assign(run.timing, {
     runStartedAt: run.timing.runStartedAt || run.createdAt || null,
@@ -129,16 +142,103 @@ function ensureRunMetrics(run) {
     totalElapsedMs: run.timing.totalElapsedMs ?? null
   });
   run.billing ||= {};
-  run.billing.estimate ||= { provider: "xinhankr", currency: "CNY", videoAmount: run.estimatedVideoCostCny ?? null, basis: "output_seconds_x_base_rate_x_0.35_discount" };
+  run.billing.estimate ||= { provider: run.videoModel === AIMANPLAY_VIDEO_MODEL ? "aimanplay" : "xinhankr", currency: "CNY", videoAmount: run.estimatedVideoCostCny ?? null, basis: run.videoModel === AIMANPLAY_VIDEO_MODEL ? "declared_seconds_x_0.06" : "output_seconds_x_base_rate_x_0.35_discount" };
   run.billing.kling ||= usageFrom(null, "kling", null);
   run.billing.h3 ||= usageFrom(null, "xinhankr", "CNY");
   return run;
 }
 
+function rejectUserStoppedRun(run) {
+  if (run.userStopped) throw new HttpError(409, "任务已在本地结束，不能再次提交付费生成");
+  if (frameCleanupWorkers.has(run.id)) throw new HttpError(409, "成片关键帧正在清理，请稍后再试");
+  if (submissionClaims.has(run.id)) throw new HttpError(409, "任务提交正在准备中，请稍后再试");
+}
+
+function claimRunSubmission(...runsToClaim) {
+  const uniqueRuns = [...new Map(runsToClaim.map((run) => [run.id, run])).values()];
+  for (const run of uniqueRuns) rejectUserStoppedRun(run);
+  for (const run of uniqueRuns) submissionClaims.add(run.id);
+  return () => { for (const run of uniqueRuns) submissionClaims.delete(run.id); };
+}
+
 function indexRunMedia(run) {
-  for (const item of [run.sourceVideo, run.productImage, run.voiceAudio, run.firstFrame, run.editedImage, ...(run.keyframes || []), ...(run.editedKeyframes || []), ...(run.imageTasks || []).map((task) => task.editedImage), run.output]) {
-    if (item?.id && item?.path) media.set(item.id, item);
+  for (const item of [run.sourceVideo, ...(run.productImages || []), run.voiceAudio, run.firstFrame, run.editedImage, ...(run.keyframes || []), ...(run.editedKeyframes || []), ...(run.imageTasks || []).map((task) => task.editedImage), run.output]) {
+    if (item?.id && item?.path && !item.localDeletedAt) media.set(item.id, item);
   }
+}
+
+async function cleanupRunKeyframes(run) {
+  if (run.stage !== "video" || normalized(run.status) !== "succeeded" || !run.output?.path || imageWorkers.has(run.id) || submissionClaims.has(run.id)) return;
+  if (run.keyframeCleanup?.completedAt && run.keyframeCleanup.outputId === run.output.id) return;
+  if (frameCleanupWorkers.has(run.id)) return frameCleanupWorkers.get(run.id);
+  const work = (async () => {
+    const inside = (root, target) => { const rel = relative(root, target); return Boolean(rel) && !rel.startsWith("..") && !isAbsolute(rel); };
+    if (!/^[a-zA-Z0-9_.-]+$/.test(run.id) || [".", ".."].includes(run.id)) return;
+    const runRoot = resolve(RUNS_DIR, run.id);
+    if (!inside(resolve(RUNS_DIR), runRoot)) return;
+    let rootReal;
+    try {
+      if ((await lstat(runRoot)).isSymbolicLink()) return;
+      rootReal = await realpath(runRoot);
+      if (!inside(await realpath(RUNS_DIR), rootReal)) return;
+      const output = resolve(run.output.path);
+      const outputRoot = resolve(runRoot, "output");
+      if (!inside(outputRoot, output) || (await lstat(outputRoot)).isSymbolicLink() || (await lstat(output)).isSymbolicLink()) return;
+      const outputReal = await realpath(output);
+      if (!inside(resolve(rootReal, "output"), outputReal) || !(await stat(outputReal)).isFile() || !(await stat(outputReal)).size) return;
+      const { stdout } = await execFileAsync(process.env.FFPROBE_PATH || "ffprobe", ["-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height", "-of", "json", outputReal], { windowsHide: true, maxBuffer: 2 * 1024 * 1024 });
+      const info = JSON.parse(stdout);
+      if (!(Number(info.format?.duration) > 0) || !info.streams?.some(stream => stream.codec_type === "video" && stream.width > 0 && stream.height > 0)) return;
+    } catch { return; } // Missing or invalid final video: keep recoverable images.
+    // Save the successful output receipt before removing any paid image result.
+    await persistRun(run);
+    const items = [run.firstFrame, run.editedImage, ...(run.keyframes || []), ...(run.editedKeyframes || []), ...(run.imageTasks || []).map(task => task.editedImage), ...(run.imageHistory || []).map(task => task.editedImage)].filter(Boolean);
+    const knownPaths = new Set([...items.map(item => item.path), ...(run.imageTasks || []).flatMap(task => [task.rawPath, task.responsePath]), ...(run.imageHistory || []).flatMap(task => [task.rawPath, task.responsePath])].filter(Boolean).map(file => resolve(file)));
+    const protectedPaths = new Set([run.sourceVideo, run.productImage, ...(run.productImages || []), run.voiceAudio, run.output, run.outputWithAudio].filter(item => item?.path).map(item => resolve(item.path)));
+    const frameDirectories = [join("keyframes", "source"), "first-frame", "kling-output"].map(category => resolve(runRoot, category));
+    const deletedPaths = new Set();
+    const stamp = new Date().toISOString();
+    try {
+      for (const directory of frameDirectories) {
+        if (!inside(runRoot, directory)) continue;
+        try {
+          if ((await lstat(directory)).isSymbolicLink() || !inside(rootReal, await realpath(directory))) continue;
+        } catch (error) { if (error.code === "ENOENT") continue; throw error; }
+        for (const entry of await readdir(directory, { withFileTypes: true })) {
+          const file = resolve(directory, entry.name);
+          // Include orphaned retry outputs/cache files only with provider-generated UUID names.
+          const generated = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}(?:-original)?\.(?:png|jpg|jpeg|webp|json)$/i.test(entry.name);
+          if (!inside(directory, file) || protectedPaths.has(file) || !entry.isFile() || (!knownPaths.has(file) && !generated)) continue;
+          if ((await lstat(file)).isSymbolicLink() || !inside(rootReal, await realpath(file))) continue;
+          await unlink(file);
+          deletedPaths.add(file);
+        }
+      }
+      for (const item of items) {
+        if (!item.path || protectedPaths.has(resolve(item.path)) || !frameDirectories.some(directory => inside(directory, resolve(item.path)))) continue;
+        let missing = deletedPaths.has(resolve(item.path));
+        if (!missing) { try { await lstat(item.path); } catch (error) { missing = error.code === "ENOENT"; } }
+        if (missing) { item.localDeletedAt = stamp; media.delete(item.id); }
+      }
+      for (const task of [...(run.imageTasks || []), ...(run.imageHistory || [])]) {
+        for (const field of ["rawPath", "responsePath"]) {
+          if (!task[field] || protectedPaths.has(resolve(task[field])) || !frameDirectories.some(directory => inside(directory, resolve(task[field])))) continue;
+          let missing = deletedPaths.has(resolve(task[field]));
+          if (!missing) { try { await lstat(task[field]); } catch (error) { missing = error.code === "ENOENT"; } }
+          if (missing) task[field] = null;
+        }
+      }
+      run.keyframeCleanup = { outputId: run.output.id, completedAt: stamp, deletedFileCount: Number(run.keyframeCleanup?.deletedFileCount || 0) + deletedPaths.size };
+    } catch {
+      // Cleanup failure never turns a successfully archived video into a generation failure.
+      run.keyframeCleanup = { outputId: run.output.id, pending: true, deletedFileCount: Number(run.keyframeCleanup?.deletedFileCount || 0) + deletedPaths.size };
+    }
+    await persistRun(run);
+  })();
+  const tracked = work.catch(() => {}); // Includes concurrent callers: cleanup must not fail video delivery.
+  frameCleanupWorkers.set(run.id, tracked);
+  try { await tracked; }
+  finally { frameCleanupWorkers.delete(run.id); }
 }
 
 async function restoreRuns() {
@@ -150,6 +250,7 @@ async function restoreRuns() {
       ensureRunMetrics(run);
       runs.set(run.id, run);
       indexRunMedia(run);
+      await cleanupRunKeyframes(run);
     } catch {}
   }
 }
@@ -180,10 +281,12 @@ async function logRun(run, event, fields = {}) {
 
 async function receiveMedia(req, kind, runId, category, originalName) {
   const mime = String(req.headers["content-type"] || "application/octet-stream").split(";")[0];
-  const name = safePart(originalName, kind === "video" ? "source.mp4" : kind === "audio" ? "voice.mp3" : "image.png");
+  const fallbackName = kind === "video" ? "source.mp4" : kind === "audio" ? "voice.mp3" : "image.png";
+  // Display names retain Unicode; on-disk files still use UUIDs and safe extensions.
+  const name = String(originalName || "").split(/[\\/]/).pop().replace(/[\u0000-\u001f\u007f]/g, "").trim() || fallbackName;
   if (!allowedMedia(kind, mime, name)) throw new HttpError(415, kind === "video" ? "视频仅支持 MP4/MOV" : kind === "audio" ? "声音样本仅支持 MP3/WAV/M4A" : "图片仅支持 JPG/PNG/WebP");
   const id = randomUUID();
-  const ext = extname(name) || (kind === "video" ? ".mp4" : kind === "audio" ? ".mp3" : ".png");
+  const ext = extname(safePart(name, fallbackName)) || (kind === "video" ? ".mp4" : kind === "audio" ? ".mp3" : ".png");
   const dir = join(RUNS_DIR, runId, category);
   await mkdir(dir, { recursive: true });
   const path = join(dir, `${id}${ext}`);
@@ -379,6 +482,118 @@ async function archiveRemote(run, remoteUrl, kind, category, outputName) {
   return item;
 }
 
+function aimanplayToken() {
+  const token = String(process.env.AIMANPLAY_TOKEN || "").trim();
+  if (!token || token === "sk-your-token") throw new HttpError(503, "视频生成服务尚未配置，请稍后再试");
+  return token;
+}
+
+function aimanplayConfigured() {
+  const token = String(process.env.AIMANPLAY_TOKEN || "").trim();
+  return Boolean(token && token !== "sk-your-token");
+}
+
+async function aimanplayJson(pathname, options = {}, timeoutMs = 30_000) {
+  const token = aimanplayToken();
+  let response;
+  try {
+    response = await fetch(`${AIMANPLAY_API_BASE}${pathname}`, {
+      ...options,
+      headers: { Authorization: `Bearer ${token}`, ...(options.body ? { "Content-Type": "application/json" } : {}) },
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+  } catch (error) {
+    const failure = new HttpError(502, "视频服务连接暂时不稳定，请稍后再试");
+    failure.transport = true;
+    failure.cause = error;
+    throw failure;
+  }
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = response.status === 401 ? "视频服务凭证无效" : response.status === 402 ? "视频服务余额不足" : response.status === 429 ? "视频服务请求过于频繁，请稍后再试" : "视频服务暂时未能处理请求";
+    throw new HttpError(response.status, message, body);
+  }
+  return body;
+}
+
+function aimanplayMime(item) {
+  const extension = extname(item?.path || "").toLowerCase();
+  if (extension === ".png") return "image/png";
+  if ([".jpg", ".jpeg"].includes(extension)) return "image/jpeg";
+  if (extension === ".wav") return "audio/wav";
+  if (extension === ".mp3") return "audio/mpeg";
+  throw new HttpError(400, "视频服务暂不支持当前关键帧或声音格式");
+}
+
+async function aimanplayUpload(item, sts) {
+  const mime = aimanplayMime(item);
+  const isAudio = mime.startsWith("audio/");
+  const limit = Number(isAudio ? sts.maxAudioBytes : sts.maxImageBytes) || (isAudio ? 20 : 10) * 1024 * 1024;
+  if (Number(item.size) > limit) throw new HttpError(413, isAudio ? "参考音频过大" : "替换关键帧过大");
+  const required = ["host", "dir", "bucket", "accessKeyId", "accessKeySecret", "securityToken"];
+  if (required.some((key) => !sts[key])) throw new HttpError(502, "视频服务素材通道未就绪");
+  const host = String(sts.host).replace(/\/$/, "");
+  const loopbackTestHost = process.env.NODE_ENV === "test" && AIMANPLAY_API_BASE.startsWith("http://127.0.0.1:") && host.startsWith("http://127.0.0.1:");
+  if (!host.startsWith("https://") && !loopbackTestHost) throw new HttpError(502, "视频服务素材通道地址无效");
+  const dir = String(sts.dir).replace(/^\/+|\/+$/g, "");
+  const key = `${dir}/${randomUUID().replaceAll("-", "")}${extname(item.path).toLowerCase()}`;
+  const date = new Date().toUTCString();
+  const canonicalHeaders = [`x-oss-date:${date}`, "x-oss-object-acl:public-read", `x-oss-security-token:${sts.securityToken}`].sort().join("\n");
+  const stringToSign = ["PUT", "", mime, date, canonicalHeaders, `/${sts.bucket}/${key}`].join("\n");
+  const signature = createHmac("sha1", sts.accessKeySecret).update(stringToSign).digest("base64");
+  const url = `${host}/${key}`;
+  let response;
+  try {
+    response = await fetch(url, {
+      method: "PUT",
+      headers: { Authorization: `OSS ${sts.accessKeyId}:${signature}`, "Content-Type": mime, "x-oss-date": date, "x-oss-object-acl": "public-read", "x-oss-security-token": sts.securityToken },
+      body: await readFile(item.path),
+      signal: AbortSignal.timeout(120_000)
+    });
+  } catch { throw new HttpError(502, "视频素材上传暂时失败，请稍后再试"); }
+  if (!response.ok) throw new HttpError(502, "视频素材上传暂时失败，请稍后再试");
+  return url;
+}
+
+async function aimanplayUploadInputs(run) {
+  run.aimanplayUploads ||= {};
+  const inputs = [...(run.editedKeyframes || []), ...(run.audioMode === "voice" ? [run.voiceAudio] : [])];
+  let sts;
+  const urls = [];
+  for (const item of inputs) {
+    if (!item?.id || !item?.path) throw new HttpError(409, "视频生成素材不完整");
+    let url = run.aimanplayUploads[item.id];
+    if (!url) {
+      sts ||= await aimanplayJson("/api/video-upload/oss-sts", { method: "POST" });
+      if (!sts.success || !sts.enabled) throw new HttpError(503, "视频服务素材通道暂时不可用");
+      url = await aimanplayUpload(item, sts);
+      run.aimanplayUploads[item.id] = url;
+      await persistRun(run);
+    }
+    urls.push(url);
+  }
+  return { imageUrls: urls.slice(0, run.editedKeyframes.length), audioUrl: run.audioMode === "voice" ? urls.at(-1) : null };
+}
+
+async function archiveAimanplayVideo(run) {
+  let response;
+  try {
+    response = await fetch(`${AIMANPLAY_API_BASE}/v1/videos/${encodeURIComponent(run.videoTaskId)}/content`, {
+      headers: { Authorization: `Bearer ${aimanplayToken()}` }, signal: AbortSignal.timeout(120_000)
+    });
+  } catch { throw new HttpError(502, "视频已生成，但下载暂时失败；可以稍后恢复原任务"); }
+  if (!response.ok) throw new HttpError(502, "视频已生成，但下载暂时失败；可以稍后恢复原任务");
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length < 12 || bytes.toString("ascii", 4, 8) !== "ftyp") throw new HttpError(502, "视频已生成，但下载结果无效；可以稍后恢复原任务");
+  const id = randomUUID();
+  const outputPath = join(RUNS_DIR, run.id, "output", `${id}.mp4`);
+  await mkdir(join(RUNS_DIR, run.id, "output"), { recursive: true });
+  await writeFile(outputPath, bytes);
+  const item = { id, name: "minimax-h3-output.mp4", mime: "video/mp4", size: bytes.length, path: outputPath, category: "output" };
+  media.set(id, item);
+  return item;
+}
+
 async function removeOutputAudio(run) {
   const source = run.output;
   if (!source?.path) throw new HttpError(409, "生成视频尚未归档，无法移除音轨");
@@ -393,6 +608,135 @@ async function removeOutputAudio(run) {
   run.audioRemovedByFfmpeg = true;
 }
 
+async function startWawImages(run, retryIndexes) {
+  if (imageWorkers.has(run.id)) throw new HttpError(409, "关键帧仍在生成，请等待完成");
+  if (!process.env.WAW_API_KEY?.trim()) throw new HttpError(409, "图片生成服务尚未配置，请配置 WAW_API_KEY");
+  const frames = run.videoMode === "multi_keyframes" ? run.keyframes || [] : [run.firstFrame];
+  const indexes = run.imageProvider === "wawapi" && run.status === "FAILED"
+    ? frames.map((_, i) => i).filter(i => run.imageTasks?.[i]?.status !== "SUCCEEDED")
+    : retryIndexes ?? frames.map((_, i) => i);
+  if (!indexes.length || indexes.some(i => !Number.isInteger(i) || !frames[i])) throw new HttpError(400, "关键帧序号无效");
+  run.imageTasks ||= [];
+  run.editedKeyframes ||= [];
+  for (const i of indexes) {
+    if (run.imageTasks[i]?.editedImage) {
+      run.imageHistory ||= [];
+      run.imageHistory.push(run.imageTasks[i]);
+    }
+    const previous = run.imageTasks[i];
+    run.imageTasks[i] = (previous?.responsePath || previous?.rawPath) && previous.status !== "SUCCEEDED"
+      ? { ...previous, status: "QUEUED" }
+      : { index: i, provider: "wawapi", status: "QUEUED", taskId: null, editedImage: null };
+    run.editedKeyframes[i] = null;
+  }
+  Object.assign(run, { imageProvider: "wawapi", imageModel: WAW_IMAGE_MODEL, stage: "image", status: "PROCESSING", imageStatus: "PROCESSING", editedImage: null, message: "正在替换关键帧", updatedAt: new Date().toISOString() });
+  run.timing.imageStartedAt = run.updatedAt;
+  imageWorkers.add(run.id);
+  try { await persistRun(run); } catch (error) { imageWorkers.delete(run.id); throw error; }
+  void (async () => {
+    for (const i of indexes) {
+      const task = run.imageTasks[i];
+      try {
+        if (!task.responsePath && !task.rawPath) {
+        const form = new FormData();
+        for (const [n, item] of [frames[i], ...run.productImages].entries()) {
+          form.append("image", new Blob([await readFile(item.path)], { type: item.mime }), n === 0 ? "scene.png" : item.name);
+        }
+        task.request = { model: WAW_IMAGE_MODEL, prompt: run.imagePrompt, size: "864x1536", quality: "medium", n: 1 };
+        for (const [name, value] of Object.entries(task.request)) form.append(name, String(value));
+        task.status = "SUBMITTING";
+        task.startedAt = new Date().toISOString();
+        await persistRun(run);
+        const response = await fetch(WAW_API_BASE + "/images/edits", {
+          method: "POST", headers: { Authorization: "Bearer " + process.env.WAW_API_KEY.trim() }, body: form,
+          signal: AbortSignal.timeout(600000)
+        });
+        task.httpStatus = response.status;
+        task.requestId = response.headers.get("x-request-id");
+        const raw = await response.text();
+        let body;
+        try { body = JSON.parse(raw); } catch { body = { error: { message: raw.slice(0, 1000) } }; }
+        if (!response.ok) {
+          task.status = response.status >= 500 || response.status === 408 ? "UNCERTAIN" : "FAILED";
+          task.providerError = body.error || body;
+          throw new Error(response.status === 401 || response.status === 403 ? "图片服务密钥无效或无权限，请检查配置" : response.status === 402 ? "图片服务余额不足，请充值后重试" : response.status === 429 ? "图片服务繁忙，请稍后重试" : "图片服务连接异常，请重试");
+        }
+        // Save the receipt before decoding/downloading: a failed archive must not trigger another paid edit.
+        task.status = "RESPONSE_RECEIVED";
+        task.responsePath = join(RUNS_DIR, run.id, "kling-output", randomUUID() + ".json");
+        await writeFile(task.responsePath, JSON.stringify(body));
+        await persistRun(run);
+        }
+        let body;
+        try { body = task.rawPath ? {} : JSON.parse(await readFile(task.responsePath, "utf8")); }
+        catch (error) { task.responsePath = null; throw error; }
+        const item = Array.isArray(body.data) ? body.data[0] : body.data;
+        let bytes;
+        if (task.rawPath) { try { bytes = await readFile(task.rawPath); } catch { task.rawPath = null; } }
+        if (bytes) { /* Reuse a downloaded original after normalization failure. */ }
+        else if (item?.b64_json) bytes = Buffer.from(item.b64_json, "base64");
+        else if (item?.url) {
+          const download = await fetch(item.url, { signal: AbortSignal.timeout(60000) });
+          if (!download.ok) {
+            if ([403, 404, 410].includes(download.status)) task.responsePath = null;
+            throw new Error("结果图片下载失败");
+          }
+          bytes = Buffer.from(await download.arrayBuffer());
+        }
+        if (!bytes?.length) { task.responsePath = null; throw new Error("服务未返回有效图片"); }
+        const imageSignature = bytes.subarray(0, 12);
+        if (!(imageSignature.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) || (bytes[0] === 255 && bytes[1] === 216) || (imageSignature.toString("ascii", 0, 4) === "RIFF" && imageSignature.toString("ascii", 8, 12) === "WEBP"))) {
+          task.responsePath = null; task.rawPath = null;
+          throw new Error("返回的图片数据无效，请重试");
+        }
+        const id = randomUUID();
+        const rawPath = join(RUNS_DIR, run.id, "kling-output", id + "-original.png");
+        const path = join(RUNS_DIR, run.id, "kling-output", id + ".png");
+        await writeFile(rawPath, bytes);
+        task.rawPath = rawPath;
+        await persistRun(run);
+        // Normalize provider size drift without cropping or stretching the product.
+        await execFileAsync(FFMPEG_PATH, ["-y", "-i", rawPath, "-frames:v", "1", "-vf", "scale=864:1536:force_original_aspect_ratio=decrease,pad=864:1536:(ow-iw)/2:(oh-ih)/2,setsar=1", path], { maxBuffer: 4 * 1024 * 1024 });
+        task.editedImage = { id, name: "edited-keyframe-" + (i + 1) + ".png", path, mime: "image/png", size: (await stat(path)).size, category: "kling-output" };
+        media.set(id, task.editedImage);
+        task.status = "SUCCEEDED";
+        task.finishedAt = new Date().toISOString();
+        task.usage = body.usage || null;
+        run.editedKeyframes[i] = task.editedImage;
+      } catch (error) {
+        if (task.status === "SUBMITTING") task.status = "UNCERTAIN";
+        else if (!["FAILED", "UNCERTAIN"].includes(task.status)) task.status = "ARCHIVE_FAILED";
+        task.error = error.message;
+      }
+      run.message = "正在替换关键帧（" + run.imageTasks.filter(t => t?.status === "SUCCEEDED").length + "/" + frames.length + "）";
+      run.updatedAt = new Date().toISOString();
+      await persistRun(run);
+      // Stop after a failure; keep completed frames and leave later frames queued.
+      if (task.status !== "SUCCEEDED") break;
+    }
+    finishWawImages(run);
+    await persistRun(run);
+  })().catch(async error => {
+    run.status = "FAILED"; run.imageStatus = "FAILED";
+    run.message = "关键帧处理已暂停，已完成图片已保留";
+    await logRun(run, "image_worker_failed", { message: error.message });
+    await persistRun(run);
+  }).finally(() => imageWorkers.delete(run.id));
+}
+
+function finishWawImages(run) {
+  const tasks = run.imageTasks || [];
+  const succeeded = tasks.length && tasks.every(t => t?.status === "SUCCEEDED" && t.editedImage);
+  run.editedKeyframes = tasks.map(t => t?.editedImage || null);
+  run.editedImage = run.editedKeyframes[0] || null;
+  run.status = run.imageStatus = succeeded ? "SUCCEEDED" : "FAILED";
+  run.message = succeeded ? "替换关键帧已全部保存，请确认后生成视频" : tasks.some(t => t?.status === "UNCERTAIN")
+    ? "连接中断，部分图片是否生成暂时无法确认。已完成图片已保留；再次生成可能重复计费，请先核对记录。"
+    : "部分关键帧未完成，已完成图片已保留；重试只处理未完成图片";
+  run.updatedAt = new Date().toISOString();
+  finishStageTiming(run, "image");
+}
+
 async function submitImageTask(run, frame, index) {
   if (!run.publicBaseUrl && !MOCK) throw new HttpError(409, "阿里云百炼图片替换需要临时公网素材通道");
   const publicMediaUrl = (item) => new URL(publicMedia(item).url, run.publicBaseUrl).toString();
@@ -404,7 +748,7 @@ async function submitImageTask(run, frame, index) {
         content: [
           { text: run.imagePrompt },
           { image: MOCK ? `https://mock.invalid/source-${index + 1}.png` : publicMediaUrl(frame) },
-          { image: MOCK ? "https://mock.invalid/product.png" : publicMediaUrl(run.productImage) }
+          ...run.productImages.map((item, productIndex) => ({ image: MOCK ? `https://mock.invalid/product-${productIndex + 1}.png` : publicMediaUrl(item) }))
         ]
       }]
     },
@@ -412,7 +756,7 @@ async function submitImageTask(run, frame, index) {
   };
   const loggedRequest = structuredClone(request);
   loggedRequest.input.messages[0].content[1].image = `[temporary HTTPS keyframe ${index + 1}]`;
-  loggedRequest.input.messages[0].content[2].image = "[temporary HTTPS product image]";
+  for (const item of loggedRequest.input.messages[0].content.slice(2)) item.image = "[temporary HTTPS product image]";
   const task = { index, taskId: null, status: "PENDING", editedImage: null, lastResponse: null, request: loggedRequest };
   if (MOCK) {
     task.taskId = `mock-image-${index + 1}-${Date.now()}`;
@@ -428,6 +772,7 @@ async function submitImageTask(run, frame, index) {
 }
 
 async function createImageStage(run, retryIndexes = null) {
+  if (!MOCK) return startWawImages(run, retryIndexes);
   run.timing.imageStartedAt = new Date().toISOString();
   const frames = run.videoMode === "multi_keyframes" ? run.keyframes || [] : [run.firstFrame];
   if (!frames.length) throw new HttpError(409, "缺少待替换关键帧");
@@ -457,7 +802,56 @@ async function createImageStage(run, retryIndexes = null) {
   await logRun(run, "image_tasks_created", { imageTaskIds: run.imageTasks.map((task) => task.taskId), retryIndexes });
 }
 
+async function createAimanplayVideoStage(run) {
+  if (!Array.isArray(run.editedKeyframes) || !run.editedKeyframes.length || run.editedKeyframes.length > 9 || run.editedKeyframes.some((item) => !item?.path)) throw new HttpError(409, "替换关键帧尚未全部完成");
+  if (run.audioMode === "voice" && !run.voiceAudio?.path) throw new HttpError(409, "声音与口型已开启，但缺少参考声音");
+  if (!MOCK) aimanplayToken();
+  run.videoProvider = "aimanplay";
+  run.videoModel = AIMANPLAY_VIDEO_MODEL;
+  run.stage = "video";
+  run.status = "submitting";
+  run.timing.videoStartedAt = new Date().toISOString();
+  run.videoSubmission = { status: "preparing", startedAt: run.timing.videoStartedAt };
+  await persistRun(run);
+  if (MOCK) {
+    run.videoTaskId = `mock-video-${Date.now()}`;
+    run.videoStatus = "PENDING";
+  } else {
+    const { imageUrls, audioUrl } = await aimanplayUploadInputs(run);
+    const request = { model: AIMANPLAY_VIDEO_MODEL, prompt: run.videoPrompt, duration: run.duration, resolution: run.resolution === "768P" ? "768p竖" : "480p竖" };
+    imageUrls.forEach((url, index) => { request[`ref_image_${index}`] = url; });
+    if (audioUrl) request.ref_audio_0 = audioUrl;
+    run.videoRequest = { model: request.model, prompt: request.prompt, duration: request.duration, resolution: request.resolution, referenceImageCount: imageUrls.length, hasReferenceAudio: Boolean(audioUrl) };
+    run.videoSubmission = { ...run.videoSubmission, status: "submitting", submittedAt: new Date().toISOString() };
+    await persistRun(run);
+    let task;
+    try {
+      task = await aimanplayJson("/v1/videos", { method: "POST", body: JSON.stringify(request) }, 60_000);
+    } catch (error) {
+      run.videoSubmission = { ...run.videoSubmission, status: error.transport || error.status >= 500 ? "uncertain" : "rejected", error: error.message, failedAt: new Date().toISOString() };
+      await persistRun(run);
+      throw error;
+    }
+    if (!task?.id) {
+      run.videoSubmission = { ...run.videoSubmission, status: "uncertain", error: "视频服务没有返回任务编号", failedAt: new Date().toISOString() };
+      await persistRun(run);
+      throw new HttpError(502, "视频提交结果暂时无法确认；为避免重复计费，未自动重试");
+    }
+    run.videoTaskId = task.id;
+    run.videoLastResponse = task;
+    run.videoStatus = task.status || "queued";
+    run.videoSubmission = { ...run.videoSubmission, status: "accepted", acceptedAt: new Date().toISOString() };
+  }
+  run.timing.videoSubmittedAt = new Date().toISOString();
+  run.status = "PENDING";
+  run.message = "视频任务已提交";
+  run.updatedAt = new Date().toISOString();
+  await persistRun(run);
+  await logRun(run, "video_task_created", { videoTaskId: run.videoTaskId, videoProvider: "aimanplay", videoMode: run.videoMode });
+}
+
 async function createVideoStage(run) {
+  if (run.videoMode === "multi_keyframes") return createAimanplayVideoStage(run);
   const referenceMode = run.videoMode === "reference_video";
   const multiKeyframeMode = run.videoMode === "multi_keyframes";
   const videoModel = videoModelForMode(run.videoMode);
@@ -549,9 +943,9 @@ async function createVideoVariant(source, videoPrompt, duration, resolution, vid
   const id = makeRunId();
   const now = new Date().toISOString();
   await ensureRunLayout(id);
-  const [sourceVideo, productImage, voiceAudio, firstFrame, editedImage] = await Promise.all([
+  const [sourceVideo, productImages, voiceAudio, firstFrame, editedImage] = await Promise.all([
     cloneMediaItem(source.sourceVideo, id, join("inputs", "source-video")),
-    cloneMediaItem(source.productImage, id, join("inputs", "product-image")),
+    Promise.all(source.productImages.map((item) => cloneMediaItem(item, id, join("inputs", "product-image")))),
     cloneMediaItem(source.voiceAudio, id, join("inputs", "voice-audio")),
     cloneMediaItem(source.firstFrame, id, "first-frame"),
     cloneMediaItem(source.editedImage, id, "kling-output")
@@ -559,22 +953,25 @@ async function createVideoVariant(source, videoPrompt, duration, resolution, vid
   const keyframes = await Promise.all((source.keyframes || []).map((item) => cloneMediaItem(item, id, join("keyframes", "source"))));
   const editedKeyframes = await Promise.all((source.editedKeyframes || []).filter(Boolean).map((item) => cloneMediaItem(item, id, "kling-output")));
   const videoModel = videoModelForMode(videoMode);
-  const estimatedVideoCostCny = estimatedH3Cost(duration, resolution, videoModel);
+  const estimatedVideoCostCny = estimatedVideoCost(duration, resolution, videoModel);
   const run = {
     id,
     derivedFromRunId: source.id,
     lineage: { type: "video_rerun", sourceRunId: source.id, reusedEditedImage: videoMode === "first_frame", reusedEditedKeyframes: videoMode === "multi_keyframes", sourceImageTaskId: source.imageTaskId || null },
-    status: "submitting", stage: "video", message: videoMode === "reference_video" ? "已复用参考素材，准备重新提交 Kling 3.0 Omni" : videoMode === "multi_keyframes" ? "已复用替换关键帧，准备提交 H3" : "已复用替换首帧，准备提交 H3", createdAt: now, updatedAt: now,
+    status: "submitting", stage: "video", message: videoMode === "reference_video" ? "已复用参考素材，准备生成视频" : videoMode === "multi_keyframes" ? "已复用替换关键帧，准备生成视频" : "已复用替换首帧，准备生成视频", createdAt: now, updatedAt: now,
     imageModel: videoMode === "reference_video" ? null : source.imageModel || BAILIAN_IMAGE_MODEL, videoModel,
-    imagePrompt: source.imagePrompt || null, videoPrompt, resolution, duration, ratio: source.ratio || "9:16", videoMode, publicBaseUrl: source.publicBaseUrl || null, audioMode: source.audioMode || "voice", voiceSource: source.voiceSource || "source_video", voiceScript: source.voiceScript || "",
-    estimatedVideoCostCny, sourceVideo, productImage, voiceAudio, firstFrame, editedImage, keyframes, editedKeyframes, keyframeTimes: source.keyframeTimes || [], imageTasks: [], output: null,
+    videoProvider: videoMode === "reference_video" ? "kling" : videoMode === "multi_keyframes" ? "aimanplay" : "xinhankr",
+    imagePrompt: source.imagePrompt || null, productSubject: source.productSubject || "", videoPrompt, resolution, duration, ratio: source.ratio || "9:16", videoMode, publicBaseUrl: source.publicBaseUrl || null, audioMode: source.audioMode || "voice", voiceSource: source.voiceSource || "source_video", voiceName: source.voiceName || null, voiceScript: source.voiceScript || "",
+    estimatedVideoCostCny, sourceVideo, productImages, productImage: productImages[0] || null, voiceAudio, firstFrame, editedImage, keyframes, editedKeyframes, keyframeTimes: source.keyframeTimes || [], imageTasks: [], output: null,
     imageTaskId: videoMode === "reference_video" ? null : source.imageTaskId || null, imageStatus: videoMode === "reference_video" ? "SKIPPED" : "SUCCEEDED", imageReused: videoMode !== "reference_video",
     videoTaskId: null, videoStatus: null, imageRequest: null, imageLastResponse: null, videoRequest: null, videoLastResponse: null,
     timing: { runStartedAt: now, imageStartedAt: null, imageSubmittedAt: null, imageCompletedAt: null, imageElapsedMs: null, videoStartedAt: null, videoSubmittedAt: null, videoCompletedAt: null, videoElapsedMs: null, totalElapsedMs: null },
     billing: {
       estimate: videoMode === "reference_video"
         ? { provider: "kling", currency: "credits", videoAmount: null, basis: "provider_task_receipt" }
-        : { provider: "xinhankr", currency: "CNY", videoAmount: estimatedVideoCostCny, basis: "output_seconds_x_base_rate_x_0.35_discount", discount: H3_OPEN_DISCOUNT },
+        : videoModel === AIMANPLAY_VIDEO_MODEL
+          ? { provider: "aimanplay", currency: "CNY", videoAmount: estimatedVideoCostCny, basis: "declared_seconds_x_0.06", discount: null }
+          : { provider: "xinhankr", currency: "CNY", videoAmount: estimatedVideoCostCny, basis: "output_seconds_x_base_rate_x_0.35_discount", discount: H3_OPEN_DISCOUNT },
       kling: { ...usageFrom(null, "kling", null), reusedFromRunId: source.id, chargedInThisRun: false },
       h3: usageFrom(null, "xinhankr", "CNY")
     }
@@ -586,9 +983,39 @@ async function createVideoVariant(source, videoPrompt, duration, resolution, vid
   return run;
 }
 
+async function refreshAimanplayVideo(run) {
+  if (!run.videoTaskId) return;
+  const task = await aimanplayJson(`/v1/videos/${encodeURIComponent(run.videoTaskId)}`);
+  run.videoLastResponse = task;
+  run.videoStatus = task.status || "unknown";
+  if (task.status === "completed") {
+    run.output = await archiveAimanplayVideo(run);
+    if (run.audioMode === "silent") await removeOutputAudio(run);
+    run.status = "SUCCEEDED";
+    run.message = "替换视频已生成";
+    finishStageTiming(run, "video");
+  } else if (task.status === "failed") {
+    run.status = "FAILED";
+    run.message = task.error?.message || "视频生成失败，请稍后重试";
+    finishStageTiming(run, "video");
+  } else {
+    run.status = "PROCESSING";
+    run.message = "正在生成替换视频";
+  }
+}
+
 async function refreshRun(run, { force = false } = {}) {
   ensureRunMetrics(run);
-  if (normalized(run.status) === "succeeded" || (!force && normalized(run.status) === "failed")) return;
+  if (run.stage === "image" && run.imageProvider === "wawapi" && !MOCK) {
+    if (!imageWorkers.has(run.id) && run.status === "PROCESSING") {
+      for (const task of run.imageTasks || []) if (task.status === "SUBMITTING") task.status = "UNCERTAIN";
+      finishWawImages(run);
+      await persistRun(run);
+    }
+    return; // Synchronous upstream has no pollable job ID. Never resubmit from a GET.
+  }
+  if (normalized(run.status) === "succeeded") { await cleanupRunKeyframes(run); return; }
+  if (!force && normalized(run.status) === "failed") return;
   if (MOCK && Date.now() - new Date(run.updatedAt).getTime() > 700) {
     if (run.stage === "image") {
       if (run.videoMode === "multi_keyframes") {
@@ -601,7 +1028,7 @@ async function refreshRun(run, { force = false } = {}) {
       }
       run.imageStatus = "SUCCEEDED";
       run.status = "SUCCEEDED";
-      run.message = run.videoMode === "multi_keyframes" ? "Mock：替换关键帧已生成，请确认后启动 H3" : "Mock：替换首帧已生成，请确认后启动 H3";
+      run.message = run.videoMode === "multi_keyframes" ? "Mock：替换关键帧已生成，请确认后生成视频" : "Mock：替换首帧已生成，请确认后生成视频";
       finishStageTiming(run, "image");
     } else {
       run.output = run.sourceVideo;
@@ -613,6 +1040,7 @@ async function refreshRun(run, { force = false } = {}) {
     }
     run.updatedAt = new Date().toISOString();
     await persistRun(run);
+    await cleanupRunKeyframes(run);
     return;
   }
   if (MOCK) return;
@@ -643,7 +1071,7 @@ async function refreshRun(run, { force = false } = {}) {
       } else if (allSucceeded) {
         run.imageStatus = "SUCCEEDED";
         run.status = "SUCCEEDED";
-        run.message = "替换关键帧已全部归档，请确认后启动 H3";
+        run.message = "替换关键帧已全部归档，请确认后生成视频";
         finishStageTiming(run, "image");
       } else {
         run.imageStatus = "PROCESSING";
@@ -662,7 +1090,7 @@ async function refreshRun(run, { force = false } = {}) {
         if (!url) throw new HttpError(502, "阿里云百炼图片任务成功但没有图片 URL", response);
         run.editedImage = await archiveRemote(run, url, "image", "kling-output", "edited-first-frame");
         run.status = "SUCCEEDED";
-        run.message = "替换首帧已归档，请确认后启动 H3";
+        run.message = "替换首帧已归档，请确认后生成视频";
         finishStageTiming(run, "image");
       } else if (status === "failed") {
         run.status = "FAILED";
@@ -673,6 +1101,8 @@ async function refreshRun(run, { force = false } = {}) {
         run.message = "正在替换商品";
       }
     }
+  } else if (run.videoProvider === "aimanplay" || run.videoModel === AIMANPLAY_VIDEO_MODEL) {
+    await refreshAimanplayVideo(run);
   } else {
     let response;
     const referenceMode = run.videoMode === "reference_video";
@@ -717,6 +1147,7 @@ async function refreshRun(run, { force = false } = {}) {
   }
   run.updatedAt = new Date().toISOString();
   await persistRun(run);
+  await cleanupRunKeyframes(run);
   await logRun(run, "run_refreshed", { stage: run.stage, status: run.status });
 }
 
@@ -738,6 +1169,13 @@ function requireMedia(id, prefix, label) {
   return item;
 }
 
+function requireProductImages(body) {
+  const ids = Object.hasOwn(body, "productImageIds") ? body.productImageIds : [body.productImageId];
+  if (!Array.isArray(ids) || ids.length < 1 || ids.length > 3) throw new HttpError(400, "商品参考图片必须为 1-3 张");
+  if (ids.some((id) => typeof id !== "string" || !id) || new Set(ids).size !== ids.length) throw new HttpError(400, "商品参考图片 ID 无效或重复");
+  return ids.map((id) => requireMedia(id, "image/", "商品图片"));
+}
+
 async function serveStatic(res, pathname) {
   const name = pathname === "/" ? "index.html" : pathname.slice(1);
   if (!new Set(["index.html", "app.js", "styles.css"]).has(name)) throw new HttpError(404, "页面不存在");
@@ -752,13 +1190,14 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     if (req.method === "GET" && url.pathname === "/api/health") return sendJson(res, 200, { ok: true, service: "kling-h3-route-b", version: "0.1.0" });
     if (req.method === "GET" && url.pathname === "/api/config") return sendJson(res, 200, {
-      configured: MOCK || Boolean(process.env.BAILIAN_API_KEY && process.env.XINHANKR_API_KEY),
+      configured: MOCK || Boolean(process.env.WAW_API_KEY && aimanplayConfigured()),
       klingConfigured: MOCK || Boolean(process.env.KLING_API_KEY),
-      imageConfigured: MOCK || Boolean(process.env.BAILIAN_API_KEY),
-      h3Configured: MOCK || Boolean(process.env.XINHANKR_API_KEY),
+      imageConfigured: MOCK || Boolean(process.env.WAW_API_KEY),
+      h3Configured: MOCK || aimanplayConfigured(),
       mock: MOCK,
-      imageModel: BAILIAN_IMAGE_MODEL,
-      videoModel: H3_OPEN_MODEL,
+      imageModel: WAW_IMAGE_MODEL,
+      videoModel: AIMANPLAY_VIDEO_MODEL,
+      videoProvider: "aimanplay",
       referenceVideoModel: KLING_VIDEO_OMNI_MODEL
     });
     if (req.method === "POST" && url.pathname === "/api/run-id") {
@@ -769,7 +1208,7 @@ const server = http.createServer(async (req, res) => {
         id: runId, status: "draft", stage: "upload", message: "Run 已创建，等待上传素材", createdAt: now, updatedAt: now,
         timing: { runStartedAt: now, imageStartedAt: null, imageSubmittedAt: null, imageCompletedAt: null, imageElapsedMs: null, videoStartedAt: null, videoSubmittedAt: null, videoCompletedAt: null, videoElapsedMs: null, totalElapsedMs: null },
         billing: {
-          estimate: { provider: "xinhankr", currency: "CNY", videoAmount: null, basis: "output_seconds_x_base_rate_x_0.35_discount", discount: H3_OPEN_DISCOUNT },
+          estimate: { provider: "aimanplay", currency: "CNY", videoAmount: null, basis: "declared_seconds_x_0.06", discount: null },
           kling: usageFrom(null, "kling", null),
           h3: usageFrom(null, "xinhankr", "CNY")
         }
@@ -790,8 +1229,11 @@ const server = http.createServer(async (req, res) => {
       const category = mediaCategory(url.searchParams.get("category"));
       const item = await receiveMedia(req, kind, runId, category, url.searchParams.get("name"));
       if (category === join("inputs", "source-video")) run.sourceVideo = item;
-      else if (category === join("inputs", "product-image")) run.productImage = item;
-      else if (category === join("inputs", "voice-audio")) run.voiceAudio = item;
+      else if (category === join("inputs", "product-image") && url.searchParams.get("attach") !== "false") {
+        run.productImages = [item];
+        run.productImage = item;
+      }
+      else if (category === join("inputs", "voice-audio") && url.searchParams.get("attach") !== "false") run.voiceAudio = item;
       else if (category === "first-frame") run.firstFrame = item;
       else if (category === join("keyframes", "source")) (run.keyframes ||= []).push(item);
       run.updatedAt = new Date().toISOString();
@@ -803,8 +1245,11 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       const id = safePart(body.runId, "invalid");
       const run = runs.get(id);
+      if (run) rejectUserStoppedRun(run);
       if (id === "invalid" || !run || run.status !== "draft") throw new HttpError(409, "runId 无效、未创建或已经提交");
       const imagePrompt = String(body.imagePrompt || "").trim();
+      const productSubject = String(body.productSubject || "").trim();
+      if (productSubject.length > 200) throw new HttpError(400, "替换主体说明不能超过 200 字");
       const videoPrompt = String(body.videoPrompt || "").trim();
       const duration = Number(body.duration);
       const resolution = body.resolution;
@@ -823,17 +1268,18 @@ const server = http.createServer(async (req, res) => {
       if (videoMode === "reference_video" && ![5, 10, 15].includes(duration)) throw new HttpError(400, "Kling 3.0 Omni 参考视频模式仅支持 5、10 或 15 秒");
       if (!allowedResolutions.includes(resolution)) throw new HttpError(400, `当前生成方式分辨率必须是 ${allowedResolutions.join(" 或 ")}`);
       if (videoMode !== "reference_video" && audioMode === "voice" && !voiceScript) throw new HttpError(400, "声音与口型开启时必须填写台词");
-      if (videoMode !== "reference_video" && audioMode === "voice" && !publicBaseUrl && !MOCK) throw new HttpError(400, "声音与口型开启时必须提供参考声音公网通道");
       const sourceVideo = requireMedia(body.sourceVideoId, "video/", "原视频");
+      const productImages = requireProductImages(body);
       const uploadedVoiceAudio = videoMode !== "reference_video" && audioMode === "voice" && voiceSource === "upload"
         ? requireMedia(body.voiceAudioId, "audio/", "声音样本")
         : null;
       Object.assign(run, {
         status: "submitting", stage: videoMode === "reference_video" ? "video" : "image", message: videoMode === "reference_video" ? "准备提交 Kling 3.0 Omni 参考视频任务" : videoMode === "multi_keyframes" ? "准备提交多张关键帧替换任务" : "准备提交商品替换任务", updatedAt: new Date().toISOString(),
-        imageModel: videoMode === "reference_video" ? null : BAILIAN_IMAGE_MODEL, videoModel, imagePrompt, videoPrompt, resolution, duration, ratio: videoMode === "reference_video" ? "adaptive" : "9:16", videoMode, publicBaseUrl, audioMode, voiceSource, voiceScript,
-        estimatedVideoCostCny: estimatedH3Cost(duration, resolution, videoModel),
+        imageModel: videoMode === "reference_video" ? null : WAW_IMAGE_MODEL, videoModel, imagePrompt, productSubject, videoPrompt, resolution, duration, ratio: videoMode === "reference_video" ? "adaptive" : "9:16", videoMode, publicBaseUrl, audioMode, voiceSource, voiceName: String(body.voiceName || "").trim() || null, voiceScript,
+        estimatedVideoCostCny: estimatedVideoCost(duration, resolution, videoModel),
+        videoProvider: videoMode === "reference_video" ? "kling" : videoMode === "multi_keyframes" ? "aimanplay" : "xinhankr",
         sourceVideo,
-        productImage: requireMedia(body.productImageId, "image/", "商品图片"),
+        productImages, productImage: productImages[0],
         voiceAudio: uploadedVoiceAudio,
         firstFrame: videoMode === "first_frame" ? requireMedia(body.firstFrameId, "image/", "首帧图片") : null,
         keyframes: videoMode === "multi_keyframes" ? (Array.isArray(body.keyframeIds) ? body.keyframeIds : []).map((mediaId) => requireMedia(mediaId, "image/", "关键帧图片")) : [],
@@ -857,6 +1303,7 @@ const server = http.createServer(async (req, res) => {
       if (videoMode === "multi_keyframes" && (run.keyframes.length < 2 || run.keyframes.length > 9)) throw new HttpError(400, "多参考关键帧必须为 2-9 张");
       run.billing.estimate.videoAmount = run.estimatedVideoCostCny;
       if (videoMode === "reference_video") Object.assign(run.billing.estimate, { provider: "kling", currency: "credits", basis: "provider_task_receipt", discount: null });
+      else if (videoMode === "multi_keyframes") Object.assign(run.billing.estimate, { provider: "aimanplay", currency: "CNY", basis: "declared_seconds_x_0.06", discount: null });
       indexRunMedia(run);
       await persistRun(run);
       await logRun(run, "run_created");
@@ -889,7 +1336,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && videoMatch) {
       const sourceRun = runs.get(videoMatch[1]);
       if (!sourceRun) throw new HttpError(404, "Run 不存在");
+      rejectUserStoppedRun(sourceRun);
       const body = await readJson(req);
+      rejectUserStoppedRun(sourceRun);
       const requestedVideoMode = body.videoMode === "reference_video" ? "reference_video" : body.videoMode === "multi_keyframes" ? "multi_keyframes" : "first_frame";
       const videoModel = videoModelForMode(requestedVideoMode);
       const allowedResolutions = videoResolutionsForMode(requestedVideoMode);
@@ -899,6 +1348,7 @@ const server = http.createServer(async (req, res) => {
       if (requestedVideoMode === "multi_keyframes" && (!sourceRun.editedKeyframes?.length || sourceRun.editedKeyframes.some((item) => !item) || normalized(sourceRun.imageStatus) !== "succeeded")) throw new HttpError(409, "请先完成并确认全部替换关键帧");
       if (sourceRun.videoTaskId && ["submitted", "processing", "pending", "in_progress"].includes(normalized(sourceRun.videoStatus))) throw new HttpError(409, "当前视频任务仍在处理中");
       if (sourceRun.videoTaskId && body.confirmResubmit !== true) throw new HttpError(409, "已有视频任务；请先检查并恢复原任务，禁止自动重复提交以避免重复计费");
+      if (!sourceRun.videoTaskId && ["submitting", "uncertain"].includes(sourceRun.videoSubmission?.status) && body.confirmResubmit !== true) throw new HttpError(409, "上次视频提交结果不确定；为避免重复计费，未自动重新提交");
       const videoPrompt = String(body.videoPrompt || sourceRun.videoPrompt || "").trim();
       const duration = Number(body.duration || sourceRun.duration);
       const resolution = allowedResolutions.includes(body.resolution) ? body.resolution : sourceRun.resolution;
@@ -908,20 +1358,86 @@ const server = http.createServer(async (req, res) => {
       if (!Number.isInteger(duration) || duration < 4 || duration > 15) throw new HttpError(400, "输出时长必须是 4-15 秒整数");
       if (videoMode === "reference_video" && ![5, 10, 15].includes(duration)) throw new HttpError(400, "Kling 3.0 Omni 参考视频模式仅支持 5、10 或 15 秒");
       if (!allowedResolutions.includes(resolution)) throw new HttpError(400, `当前生成方式分辨率必须是 ${allowedResolutions.join(" 或 ")}`);
+      const audioMode = body.audioMode === "silent" ? "silent" : body.audioMode === "voice" ? "voice" : sourceRun.audioMode || "voice";
+      const voiceScript = String(body.voiceScript ?? sourceRun.voiceScript ?? "").trim();
+      const voiceAudio = videoMode !== "reference_video" && audioMode === "voice" && body.voiceAudioId
+        ? requireMedia(body.voiceAudioId, "audio/", "声音样本") : sourceRun.voiceAudio;
+      if (videoMode !== "reference_video" && audioMode === "voice" && !voiceScript) throw new HttpError(400, "声音与口型开启时必须填写台词");
       const run = sourceRun.videoTaskId ? await createVideoVariant(sourceRun, videoPrompt, duration, resolution, videoMode) : sourceRun;
+      try {
+        rejectUserStoppedRun(sourceRun);
+        rejectUserStoppedRun(run);
+      } catch (error) {
+        if (run !== sourceRun) {
+          run.status = "FAILED";
+          run.message = "原任务已在本地结束，派生视频未提交";
+          if (sourceRun.userStopped) run.userStopped = { ...sourceRun.userStopped, inheritedFromRunId: sourceRun.id };
+          run.updatedAt = new Date().toISOString();
+          await persistRun(run);
+          await logRun(run, "video_variant_submission_blocked", { sourceRunId: sourceRun.id });
+        }
+        throw error;
+      }
       run.videoPrompt = videoPrompt;
-      run.voiceScript = String(body.voiceScript ?? run.voiceScript ?? "").trim();
-      run.audioMode = body.audioMode === "silent" ? "silent" : run.audioMode || "voice";
+      run.voiceScript = voiceScript;
+      run.audioMode = audioMode;
+      if (videoMode !== "reference_video") {
+        // Keep the selected sample when sound is disabled so a failed silent
+        // submission can later be retried with sound. UploadInputs checks audioMode.
+        if (audioMode === "voice") run.voiceAudio = voiceAudio;
+        if (audioMode === "voice" && body.voiceAudioId) {
+          run.voiceName = String(body.voiceName || "").trim() || null;
+          run.voiceId = body.voiceId || null;
+          run.voiceSource = "upload";
+        }
+      }
       run.duration = duration;
       run.resolution = resolution;
       run.videoMode = videoMode;
       run.videoModel = videoModel;
+      run.videoProvider = videoMode === "reference_video" ? "kling" : videoMode === "multi_keyframes" ? "aimanplay" : "xinhankr";
       run.publicBaseUrl = publicBaseUrl;
-      run.estimatedVideoCostCny = estimatedH3Cost(run.duration, run.resolution, videoModel);
+      run.estimatedVideoCostCny = estimatedVideoCost(run.duration, run.resolution, videoModel);
       run.billing.estimate.videoAmount = run.estimatedVideoCostCny;
-      try { await createVideoStage(run); }
-      catch (error) { run.status = "FAILED"; run.videoStatus = "FAILED"; run.message = error.message; run.videoLastResponse = error.details; if (videoMode === "reference_video") run.billing.kling = mergeUsage(run.billing.kling, error.details, "kling", null); else run.billing.h3 = mergeUsage(run.billing.h3, error.details, "xinhankr", "CNY"); finishStageTiming(run, "video"); await persistRun(run); throw error; }
-      return sendJson(res, 201, publicRun(run));
+      if (videoMode === "multi_keyframes") Object.assign(run.billing.estimate, { provider: "aimanplay", currency: "CNY", basis: "declared_seconds_x_0.06", discount: null });
+      const releaseSubmission = claimRunSubmission(sourceRun, run);
+      try {
+        try { await createVideoStage(run); }
+        catch (error) { run.status = "FAILED"; run.videoStatus = "FAILED"; run.message = error.message; run.videoLastResponse = error.details; if (videoMode === "reference_video") run.billing.kling = mergeUsage(run.billing.kling, error.details, "kling", null); else if (videoMode !== "multi_keyframes") run.billing.h3 = mergeUsage(run.billing.h3, error.details, "xinhankr", "CNY"); finishStageTiming(run, "video"); await persistRun(run); throw error; }
+        return sendJson(res, 201, publicRun(run));
+      } finally {
+        releaseSubmission();
+      }
+    }
+    const stopMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/stop$/);
+    if (req.method === "POST" && stopMatch) {
+      const run = runs.get(stopMatch[1]);
+      if (!run) throw new HttpError(404, "Run 不存在");
+      const body = await readJson(req);
+      const stage = body.stage;
+      if (stage !== "image" && stage !== "video") throw new HttpError(400, "停止阶段无效");
+      if (run.userStopped) {
+        if (run.userStopped.stage !== stage) throw new HttpError(409, "任务已在其他阶段结束");
+        return sendJson(res, 200, publicRun(run));
+      }
+      if (submissionClaims.has(run.id)) throw new HttpError(409, "任务正在提交，暂时不能结束");
+      if (stage === "image") {
+        const submissionStatus = String(run.videoSubmission?.status || "").toLowerCase();
+        const submissionInFlight = ["preparing", "submitting", "accepted", "uncertain"].includes(submissionStatus);
+        const allKeyframesComplete = Array.isArray(run.editedKeyframes) && run.editedKeyframes.length > 0
+          && run.editedKeyframes.every((item) => item?.id);
+        if (run.stage !== "image" || normalized(run.imageStatus) !== "succeeded" || normalized(run.status) !== "succeeded"
+          || !allKeyframesComplete || imageWorkers.has(run.id) || run.videoTaskId || submissionInFlight) {
+          throw new HttpError(409, "仅可在全部关键帧完成且视频尚未提交时结束图片阶段");
+        }
+      } else if (run.stage !== "video" || !run.videoTaskId) {
+        throw new HttpError(409, "仅可结束已有服务商任务 ID 的视频阶段");
+      }
+      run.userStopped = { stage, stoppedAt: new Date().toISOString() };
+      run.updatedAt = run.userStopped.stoppedAt;
+      await persistRun(run);
+      await logRun(run, "run_user_stopped", { stage });
+      return sendJson(res, 200, publicRun(run));
     }
     const resumeMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/resume$/);
     if (req.method === "POST" && resumeMatch) {
@@ -932,6 +1448,10 @@ const server = http.createServer(async (req, res) => {
         : run.videoMode === "multi_keyframes"
           ? Boolean(run.imageTasks?.some((task) => task.taskId))
           : Boolean(run.imageTaskId);
+      if (run.imageProvider === "wawapi" && run.stage === "image") {
+        await refreshRun(run, { force: true });
+        return sendJson(res, 200, publicRun(run));
+      }
       if (!hasProviderTask) throw new HttpError(409, "原任务没有可查询的任务 ID；为避免重复计费，未自动重新提交");
       await refreshRun(run, { force: true });
       await logRun(run, "run_resume_checked", { stage: run.stage, status: run.status });
@@ -948,10 +1468,17 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && retryImageMatch) {
       const run = runs.get(retryImageMatch[1]);
       if (!run) throw new HttpError(404, "Run 不存在");
+      rejectUserStoppedRun(run);
       const body = await readJson(req);
+      rejectUserStoppedRun(run);
       const retryIndexes = [...new Set((Array.isArray(body.indexes) ? body.indexes : url.searchParams.has("index") ? [Number(url.searchParams.get("index"))] : []).map(Number))].sort((a, b) => a - b);
+      if (body.continueOnly === true && run.imageProvider === "wawapi") {
+        await refreshRun(run);
+        rejectUserStoppedRun(run);
+        if (imageWorkers.has(run.id) || run.imageStatus === "SUCCEEDED") return sendJson(res, 200, publicRun(run));
+      }
       if (!run.productImage || (run.videoMode === "multi_keyframes" ? !run.keyframes?.length : !run.firstFrame)) throw new HttpError(409, "缺少产品图或原始关键帧");
-      run.status = "submitting";
+      if (imageWorkers.has(run.id)) throw new HttpError(409, "关键帧仍在生成，请等待完成");
       run.stage = "image";
       run.imageTaskId = null;
       run.imageStatus = null;
@@ -987,7 +1514,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`阿里云百炼 Kling Image -> MiniMax H3: http://127.0.0.1:${PORT}`);
+  console.log(`商品替换本地服务: http://127.0.0.1:${PORT}`);
   console.log(MOCK ? "Mode: mock" : "Mode: live");
 });
 

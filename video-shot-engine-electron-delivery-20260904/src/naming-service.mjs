@@ -51,7 +51,7 @@ export function validateAndNormalizeLabels(raw, shots, durationSec = Math.max(..
 
 function parseJsonText(value) { return JSON.parse(String(value || "").trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")); }
 
-export async function createAnnotatedAnalysisVideo(inputPath, shots, outputPath) {
+export async function createAnnotatedAnalysisVideo(inputPath, shots, outputPath, signal) {
   const durationSec = Math.max(0.1, Number(shots.at(-1)?.endSec || 1));
   const totalKbps = Math.max(96, Math.min(900, Math.floor((7 * 8192) / durationSec)));
   const videoKbps = Math.max(48, totalKbps - 48);
@@ -60,13 +60,15 @@ export async function createAnnotatedAnalysisVideo(inputPath, shots, outputPath)
     return `drawtext=text='${label}':x=16:y=16:fontsize=34:fontcolor=white:box=1:boxcolor=black@0.78:boxborderw=10:enable='between(t,${shot.startSec},${shot.endSec})'`;
   }).join(",");
   const filters = `fps=15,scale=480:-2,${overlays}`;
-  await execFileAsync(ffmpegPath, ["-y", "-i", inputPath, "-vf", filters, "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-b:v", `${videoKbps}k`, "-maxrate", `${videoKbps}k`, "-bufsize", `${videoKbps * 2}k`, "-c:a", "aac", "-b:a", "48k", "-movflags", "+faststart", outputPath], { maxBuffer: 8 * 1024 * 1024 });
+  await execFileAsync(ffmpegPath, ["-y", "-i", inputPath, "-vf", filters, "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-b:v", `${videoKbps}k`, "-maxrate", `${videoKbps}k`, "-bufsize", `${videoKbps * 2}k`, "-c:a", "aac", "-b:a", "48k", "-movflags", "+faststart", outputPath], { maxBuffer: 8 * 1024 * 1024, signal });
   const stat = await fsp.stat(outputPath);
   return { targetMaxBytes: 7 * 1024 * 1024, actualBytes: stat.size, base64EstimatedBytes: Math.ceil(stat.size * 4 / 3), fps: 15, width: 480, videoKbps, audioKbps: 48 };
 }
 
-export async function executeShotNaming({ runDir, initialRun, gemini, onStage }) {
-  let run = initialRun; const artifactsDir = path.join(runDir, "artifacts"); await fsp.mkdir(artifactsDir, { recursive: true }); const stage = async (name, patch = {}) => { run = await onStage(name, patch); return run; };
+export async function executeShotNaming({ runDir, initialRun, gemini, onStage, signal }) {
+  let run = initialRun; const artifactsDir = path.join(runDir, "artifacts"); await fsp.mkdir(artifactsDir, { recursive: true }); const stage = async (name, patch = {}) => { signal?.throwIfAborted(); run = await onStage(name, patch); signal?.throwIfAborted(); return run; };
+  const inputPath = run.processingInput || run.input;
+  signal?.throwIfAborted();
   const profile = createNamingProfile(run.shots, run.durationSec, run.cuts || [], run.fps || 30); await fsp.writeFile(path.join(artifactsDir, "naming_prompt_snapshot.txt"), profile.prompt, "utf8"); await writeJson(path.join(artifactsDir, "naming_schema_snapshot.json"), profile.schema); await writeJson(path.join(artifactsDir, "shot_manifest_for_gemini.json"), profile.manifest);
   let raw; let result;
   try {
@@ -77,8 +79,8 @@ export async function executeShotNaming({ runDir, initialRun, gemini, onStage })
   catch {
     await stage("analysis_video_processing");
     const analysisInput = path.join(artifactsDir, "analysis_input_numbered.mp4");
-    const analysisConfig = await createAnnotatedAnalysisVideo(run.input, run.shots, analysisInput);
-    await writeJson(path.join(artifactsDir, "analysis_input_config.json"), { source: run.input, output: analysisInput, overlay: "persistent shot_id", timelineChanged: false, audioPreserved: true, uploadMethod: "google-native-inlineData-compressed-proxy", ...analysisConfig });
+    const analysisConfig = await createAnnotatedAnalysisVideo(inputPath, run.shots, analysisInput, signal);
+    await writeJson(path.join(artifactsDir, "analysis_input_config.json"), { source: inputPath, output: analysisInput, overlay: "persistent shot_id", timelineChanged: false, audioPreserved: true, uploadMethod: "google-native-inlineData-compressed-proxy", ...analysisConfig });
     await stage("analysis_video_completed");
     const file = await gemini.uploadVideo(analysisInput, path.basename(analysisInput), "video/mp4");
     await writeJson(path.join(artifactsDir, "gemini_file_created.json"), file);
@@ -95,7 +97,7 @@ export async function executeShotNaming({ runDir, initialRun, gemini, onStage })
       await stage(latest.waitMs ? "provider_retry" : "provider_processing", { providerAttemptCount: allAttempts.length, providerAttemptLevel: latest.level, providerAttemptRepeat: latest.repeat, providerAttemptMode: latest.schemaMode, providerRetryDelayMs: latest.waitMs || 0 });
     };
     try {
-      result = await gemini.analyze(file.uri, profile, { validateParsed: (value) => validateAndNormalizeLabels(value, run.shots, run.durationSec, profile), onAttempt: persistAttempts });
+      result = await gemini.analyze(file.uri, profile, { validateParsed: (value) => validateAndNormalizeLabels(value, run.shots, run.durationSec, profile), onAttempt: persistAttempts, signal });
     } catch (error) {
       if (error.requestAttempts) error.requestAttempts = [...priorAttempts, ...error.requestAttempts];
       if (error.providerResponses) error.providerResponses = [...priorResponses, ...error.providerResponses];
@@ -121,6 +123,7 @@ export async function executeShotNaming({ runDir, initialRun, gemini, onStage })
   const fps = Math.max(1, Number(run.fps || 30));
   const usedFilenames = new Set();
   for (const [index, label] of labels.entries()) {
+    signal?.throwIfAborted();
     const filename = createUniqueFilename(createNamedFilename(label, index, ".mp4"), usedFilenames);
     const output = path.join(namedDir, filename);
     const startFrame = Math.max(0, Math.round(label.startSec * fps));
@@ -128,7 +131,8 @@ export async function executeShotNaming({ runDir, initialRun, gemini, onStage })
     const frameCount = endFrame - startFrame;
     const startSec = startFrame / fps;
     const durationSec = frameCount / fps;
-    await execFileAsync(ffmpegPath, ["-y", "-i", run.input, "-ss", String(startSec), "-t", String(durationSec), "-map", "0:v:0", "-map", "0:a?", "-frames:v", String(frameCount), "-c:v", "libx264", "-c:a", "aac", "-preset", "veryfast", "-crf", "20", "-movflags", "+faststart", output], { maxBuffer: 4 * 1024 * 1024 });
+    const audioArgs = run.keepAudio === false ? ["-an"] : ["-map", "0:a?", "-c:a", "aac"];
+    await execFileAsync(ffmpegPath, ["-y", "-i", inputPath, "-ss", String(startSec), "-t", String(durationSec), "-map", "0:v:0", ...audioArgs, "-frames:v", String(frameCount), "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-movflags", "+faststart", output], { maxBuffer: 4 * 1024 * 1024, signal });
     manifest.push({ ...label, startFrame, endFrame, frameCount, startSec, endSec: endFrame / fps, durationSec, namedPath: `named_segments/${filename}`, namedFilename: filename });
   }
   const requestAttempts = result?.requestAttempts || [];

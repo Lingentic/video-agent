@@ -82,3 +82,17 @@ test("marks a transport timeout cost unknown and retries the same level", async 
   assert.equal(result.requestAttempts[0].costStatus, "unknown");
   assert.equal(result.requestAttempts[1].repeat, 2);
 }));
+
+test("cancellation aborts an in-flight request without starting another paid attempt", async () => withVideo(async (file) => {
+  const controller = new AbortController();
+  let requests = 0;
+  globalThis.fetch = (_url, init) => {
+    requests += 1;
+    return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+  };
+  const service = createXinhankrService({ apiKey: "test", model: "test", retryDelaysMs: [0, 0, 0] });
+  const task = service.analyze(file, { prompt: "test", schema: { type: "object" } }, { signal: controller.signal });
+  setTimeout(() => controller.abort(new Error("用户取消任务")), 10);
+  await assert.rejects(task, /用户取消任务/);
+  assert.equal(requests, 1);
+}));

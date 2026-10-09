@@ -49,6 +49,18 @@ function attachDiagnostics(error, requestAttempts, providerResponses, usages) {
 }
 
 export function createXinhankrService({ apiKey, model, baseUrl = "https://token.xinhankr.com", retryDelaysMs = [5000, 8000, 12000], sleep = defaultSleep }) {
+  const waitForRetry = async (ms, signal) => {
+    if (!signal) return sleep(ms);
+    signal.throwIfAborted();
+    let onAbort;
+    try {
+      await Promise.race([sleep(ms), new Promise((_, reject) => {
+        onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+      })]);
+      signal.throwIfAborted();
+    } finally { signal.removeEventListener("abort", onAbort); }
+  };
   return {
     async uploadVideo(filePath, displayName, mimeType) {
       const stat = await fsp.stat(filePath);
@@ -59,7 +71,8 @@ export function createXinhankrService({ apiKey, model, baseUrl = "https://token.
       await onState?.(file);
       return file;
     },
-    async analyze(filePath, profile, { validateParsed, onAttempt } = {}) {
+    async analyze(filePath, profile, { validateParsed, onAttempt, signal } = {}) {
+      signal?.throwIfAborted();
       const data = (await fsp.readFile(filePath)).toString("base64");
       const requestAttempts = [];
       const providerResponses = [];
@@ -72,6 +85,7 @@ export function createXinhankrService({ apiKey, model, baseUrl = "https://token.
       for (let levelIndex = 0; levelIndex < MODES.length; levelIndex += 1) {
         const mode = MODES[levelIndex];
         for (let repeat = 1; repeat <= 2; repeat += 1) {
+          signal?.throwIfAborted();
           requestNumber += 1;
           const startedAt = new Date().toISOString();
           const generationConfig = { temperature: 0, maxOutputTokens: mode.responseMimeType ? 12000 : 8000, thinkingConfig: { thinkingBudget: 0 } };
@@ -86,7 +100,7 @@ export function createXinhankrService({ apiKey, model, baseUrl = "https://token.
               method: "POST",
               headers: { "X-Goog-Api-Key": apiKey, "Content-Type": "application/json" },
               body: JSON.stringify({ contents: [{ role: "user", parts: [{ inlineData: { mimeType: "video/mp4", data } }, { text: prompt }] }], generationConfig }),
-              signal: AbortSignal.timeout(timeoutMs),
+              signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
             });
           } catch (cause) {
             const waitMs = repeat === 1 ? Number(retryDelaysMs[levelIndex] || 0) : 0;
@@ -94,7 +108,8 @@ export function createXinhankrService({ apiKey, model, baseUrl = "https://token.
             requestAttempts.push(attemptRecord);
             lastError = attachDiagnostics(cause, requestAttempts, providerResponses, usages);
             await onAttempt?.({ requestAttempts, providerResponses, usage: lastError.usage, latest: attemptRecord });
-            if (repeat === 1) { await sleep(waitMs); continue; }
+            if (signal?.aborted) throw lastError;
+            if (repeat === 1) { await waitForRetry(waitMs, signal); continue; }
             break;
           }
 
@@ -114,7 +129,7 @@ export function createXinhankrService({ apiKey, model, baseUrl = "https://token.
             lastError = attachDiagnostics(error, requestAttempts, providerResponses, usages);
             await onAttempt?.({ requestAttempts, providerResponses, usage: lastError.usage, latest: attemptRecord });
             if ([401, 402, 403, 404, 429].includes(response.status) || !retryable) throw lastError;
-            if (repeat === 1) { await sleep(waitMs); continue; }
+            if (repeat === 1) { await waitForRetry(waitMs, signal); continue; }
             break;
           }
 
@@ -139,7 +154,7 @@ export function createXinhankrService({ apiKey, model, baseUrl = "https://token.
             lastError.providerResponse = body;
             lastError = attachDiagnostics(lastError, requestAttempts, providerResponses, usages);
             await onAttempt?.({ requestAttempts, providerResponses, usage: lastError.usage, latest: attemptRecord });
-            if (repeat === 1) { await sleep(waitMs); continue; }
+            if (repeat === 1) { await waitForRetry(waitMs, signal); continue; }
             break;
           }
 
