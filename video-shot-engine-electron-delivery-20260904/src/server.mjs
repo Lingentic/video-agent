@@ -5,7 +5,7 @@ import fsp from "node:fs/promises";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { processVideo } from "./shot-service.mjs";
+import { processVideo, SHOT_DETECTION_VERSION, assertCurrentShotDetection } from "./shot-service.mjs";
 import { createXinhankrService } from "./xinhankr-service.mjs";
 import { executeShotNaming } from "./naming-service.mjs";
 import { configureHttpsProxy, serializeError } from "./network.mjs";
@@ -25,7 +25,6 @@ const uploadsDir = path.join(runsDir, "_uploads");
 const apiKey = process.env.XINHANKR_API_KEY || "";
 let wuhenApiKey = overrides.subtitleApiKey ?? process.env.WUHEN_API_KEY ?? "";
 const model = process.env.XINHANKR_MODEL || "gemini-3.6-flash";
-const pollMs = Math.max(1000, Number(process.env.POLL_INTERVAL_MS || 5000));
 const proxyConfigured = configureHttpsProxy(process.env.GEMINI_HTTPS_PROXY || "");
 const gemini = overrides.gemini ?? (apiKey ? createXinhankrService({ apiKey, model, baseUrl: process.env.XINHANKR_BASE_URL }) : null);
 const transportManager = overrides.transportManager || await createWuhenTransport({ runsDir });
@@ -120,6 +119,9 @@ async function latestRunId() {
 async function executeNaming(runId) {
   if (!gemini) throw new Error("XINHANKR_API_KEY 未配置");
   if (activeNamingRuns.has(runId)) return;
+  try { assertCurrentShotDetection(await loadRun(runId)); }
+  catch (error) { if (error.code === "SHOT_DETECTION_VERSION_MISMATCH") return; throw error; }
+  if (activeNamingRuns.has(runId)) return;
   activeNamingRuns.add(runId);
   const runDir = path.join(runsDir, runId);
   const namingStartedAt = Date.now();
@@ -198,6 +200,14 @@ app.get("/api/runs/latest", async (_req, res) => {
 });
 
 const batchDirFor = (batchId) => { if (!/^batch_[a-zA-Z0-9_]+$/.test(batchId)) throw new Error("批次 ID 无效"); return path.join(runsDir, batchId); };
+async function assertBatchDetection(batchDir, batch, onlyVideoId = null) {
+  assertCurrentShotDetection(batch);
+  for (const ref of batch.items) {
+    if (onlyVideoId && ref.videoId !== onlyVideoId) continue;
+    const item = JSON.parse(await fsp.readFile(path.join(batchDir, "items", ref.videoId, "item.json"), "utf8"));
+    if (item.status !== "completed") assertCurrentShotDetection(item);
+  }
+}
 app.get("/api/batches/:batchId", async (req, res) => { try { const batchDir = batchDirFor(req.params.batchId); const batch = await loadBatch(batchDir); const items=[]; for (const item of batch.items) { try { const itemDir=path.join(batchDir,"items",item.videoId); const full=JSON.parse(await fsp.readFile(path.join(itemDir,"item.json"),"utf8")); full.renameManifest=await readOptionalJson(path.join(itemDir,"artifacts","rename_manifest.json")); full.errorRecord=await readOptionalJson(path.join(itemDir,"artifacts","error.json")); items.push(publicItem(full)); } catch { items.push(publicItem(item)); } } res.json({ batch: { ...batch, active: activeBatches.has(batch.batchId) }, items }); } catch { res.status(404).json({ error: "批次不存在" }); } });
 
 async function finalizeCancelledBatch(batchDir, batch) {
@@ -246,6 +256,7 @@ async function executeBatch(batchId, onlyVideoId = null) {
   try {
     let batch = await loadBatch(batchDir);
     if (batch.status === "cancelled") return;
+    await assertBatchDetection(batchDir, batch, onlyVideoId);
     const executionStartedAt = new Date().toISOString(); const previousWallMs = Number(batch.wallDurationMs || 0);
     batch.status = "processing"; batch.startedAt ||= executionStartedAt; batch.executionStartedAt = executionStartedAt; batch.executionHistory = [...(batch.executionHistory || []), { startedAt: executionStartedAt, mode: onlyVideoId ? "single_retry" : "batch", videoId: onlyVideoId }]; await saveBatch(batchDir, batch);
     for (const itemRef of batch.items) {
@@ -270,7 +281,7 @@ async function executeBatch(batchId, onlyVideoId = null) {
     const csvRows=catalog.map((x)=>[x.videoId,x.sourceFilename,x.shotId,x.startSec??"",x.endSec??"",x.namedFilename,x.usageType||""].map(csvEscape).join(","));
     await fsp.writeFile(path.join(batchDir,"catalog.csv"),`\uFEFF${[csvHeader,...csvRows].join("\r\n")}\r\n`,"utf8");
     const lastExecution=batch.executionHistory.at(-1); Object.assign(lastExecution,{finishedAt:batch.finishedAt,status:batch.status,durationMs:Date.parse(batch.finishedAt)-Date.parse(lastExecution.startedAt)}); await saveBatch(batchDir, batch);
-  } catch (error) { const batch=await loadBatch(batchDir); if (controller.signal.aborted) await finalizeCancelledBatch(batchDir, batch); else { batch.status="failed"; batch.error=serializeError(error); batch.finishedAt=new Date().toISOString(); await writeBatchJson(path.join(batchDir,"batch_error.json"),batch.error); await saveBatch(batchDir,batch); } } finally { activeBatches.delete(batchId); batchExecutions.delete(batchId); resolveDone(); }
+  } catch (error) { if (error.code !== "SHOT_DETECTION_VERSION_MISMATCH") { const batch=await loadBatch(batchDir); if (controller.signal.aborted) await finalizeCancelledBatch(batchDir, batch); else { batch.status="failed"; batch.error=serializeError(error); batch.finishedAt=new Date().toISOString(); await writeBatchJson(path.join(batchDir,"batch_error.json"),batch.error); await saveBatch(batchDir,batch); } } } finally { activeBatches.delete(batchId); batchExecutions.delete(batchId); resolveDone(); }
 }
 
 app.post("/api/batches", upload.array("videos", 100), async (req, res) => {
@@ -286,14 +297,14 @@ app.post("/api/batches", upload.array("videos", 100), async (req, res) => {
     const itemOptions = req.files.map((_file, index) => removeSubtitles ? validateWuhenOptions({ ...commonOptions, ...(commonOptions.method !== "all_area" && folderManifest[index]?.subtitleRectNormalized ? { rectNormalized: folderManifest[index].subtitleRectNormalized } : {}) }) : null);
     const batchId = `batch_${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}_${Math.random().toString(36).slice(2, 8)}`;
     const batchDir = path.join(runsDir, batchId); await fsp.mkdir(path.join(batchDir, "items"), { recursive: true });
-    const batch = { batchId, workflow, removeSubtitles, ...(removeSubtitles ? { subtitleProvider: "wuhen", subtitleOptions: { model: itemOptions[0].model, method: itemOptions[0].method } } : {}), status: "queued", createdAt: new Date().toISOString(), threshold: Math.max(0, Number(req.body?.threshold || 12)), minDurationSec: Math.max(0.1, Number(req.body?.minDurationSec || 0.2)), autoName: workflow === "ffmpeg_gemini_naming", keepAudio: req.body?.keepAudio === "on", processingMode: "serial", folderMode: folderManifest.some((entry) => entry?.sourceFolderId), items: [] };
+    const batch = { batchId, shotDetectionVersion: SHOT_DETECTION_VERSION, workflow, removeSubtitles, ...(removeSubtitles ? { subtitleProvider: "wuhen", subtitleOptions: { model: itemOptions[0].model, method: itemOptions[0].method } } : {}), status: "queued", createdAt: new Date().toISOString(), threshold: Math.max(0, Number(req.body?.threshold || 12)), minDurationSec: Math.max(0.1, Number(req.body?.minDurationSec || 0.2)), autoName: workflow === "ffmpeg_gemini_naming", keepAudio: req.body?.keepAudio === "on", processingMode: "serial", folderMode: folderManifest.some((entry) => entry?.sourceFolderId), items: [] };
     if (batch.autoName && !gemini) throw new Error("XINHANKR_API_KEY 未配置，无法执行批量自动命名");
-    for (let index=0; index<req.files.length; index++) { const file=req.files[index]; const folderMeta=folderManifest[index]||{}; const videoId=`video_${String(index+1).padStart(3,"0")}`; const itemDir=path.join(batchDir,"items",videoId); await fsp.mkdir(itemDir,{recursive:true}); const ext=path.extname(file.originalname)||".mp4"; const input=path.join(itemDir,`input${ext}`); await fsp.copyFile(file.path,input); await fsp.rm(file.path,{force:true}); const queuedAt=new Date().toISOString(); const item={videoId,workflow,removeSubtitles,...(removeSubtitles ? { subtitleProvider: "wuhen", subtitleOptions: itemOptions[index] } : {}),sourceFilename:file.originalname,sourceFolderId:folderMeta.sourceFolderId||null,sourceFolderName:folderMeta.sourceFolderName||null,sourceRelativePath:folderMeta.sourceRelativePath||file.originalname,input,status:"queued",stage:"queued",queuedAt,autoName:batch.autoName,keepAudio:batch.keepAudio,attempts:[],activeDurationMs:0,quotaWaitDurationMs:0}; await writeBatchJson(path.join(itemDir,"item.json"),item); batch.items.push({videoId,status:"queued",sourceFilename:file.originalname,sourceFolderId:item.sourceFolderId,sourceFolderName:item.sourceFolderName,sourceRelativePath:item.sourceRelativePath,...(removeSubtitles ? { subtitleOptions: item.subtitleOptions } : {})}); }
+    for (let index=0; index<req.files.length; index++) { const file=req.files[index]; const folderMeta=folderManifest[index]||{}; const videoId=`video_${String(index+1).padStart(3,"0")}`; const itemDir=path.join(batchDir,"items",videoId); await fsp.mkdir(itemDir,{recursive:true}); const ext=path.extname(file.originalname)||".mp4"; const input=path.join(itemDir,`input${ext}`); await fsp.copyFile(file.path,input); await fsp.rm(file.path,{force:true}); const queuedAt=new Date().toISOString(); const item={videoId,shotDetectionVersion:SHOT_DETECTION_VERSION,workflow,removeSubtitles,...(removeSubtitles ? { subtitleProvider: "wuhen", subtitleOptions: itemOptions[index] } : {}),sourceFilename:file.originalname,sourceFolderId:folderMeta.sourceFolderId||null,sourceFolderName:folderMeta.sourceFolderName||null,sourceRelativePath:folderMeta.sourceRelativePath||file.originalname,input,status:"queued",stage:"queued",queuedAt,autoName:batch.autoName,keepAudio:batch.keepAudio,attempts:[],activeDurationMs:0,quotaWaitDurationMs:0}; await writeBatchJson(path.join(itemDir,"item.json"),item); batch.items.push({videoId,status:"queued",sourceFilename:file.originalname,sourceFolderId:item.sourceFolderId,sourceFolderName:item.sourceFolderName,sourceRelativePath:item.sourceRelativePath,...(removeSubtitles ? { subtitleOptions: item.subtitleOptions } : {})}); }
     await saveBatch(batchDir,batch); void executeBatch(batchId); res.status(202).json({batchId,itemCount:batch.items.length});
   } catch (error) { for(const file of req.files||[]) await fsp.rm(file.path,{force:true}); res.status(500).json({error:serializeError(error).message}); }
 });
 
-app.post("/api/batches/:batchId/resume", async (req,res)=>{ try { const batch=await loadBatch(batchDirFor(req.params.batchId)); if (["cancelled","completed"].includes(batch.status)) throw new Error("任务已结束，不能继续处理"); requireSubtitleKey(batch.removeSubtitles); void executeBatch(req.params.batchId); res.status(202).json({batchId:req.params.batchId,resumed:true}); } catch(error){ res.status(400).json({error:error.message}); } });
+app.post("/api/batches/:batchId/resume", async (req,res)=>{ try { const batch=await loadBatch(batchDirFor(req.params.batchId)); if (["cancelled","completed"].includes(batch.status)) throw new Error("任务已结束，不能继续处理"); await assertBatchDetection(batchDirFor(req.params.batchId), batch); requireSubtitleKey(batch.removeSubtitles); void executeBatch(req.params.batchId); res.status(202).json({batchId:req.params.batchId,resumed:true}); } catch(error){ res.status(400).json({error:error.message}); } });
 app.post("/api/batches/:batchId/cancel", async (req, res) => {
   try {
     const batchDir = batchDirFor(req.params.batchId);
@@ -310,7 +321,7 @@ app.post("/api/batches/:batchId/cancel", async (req, res) => {
     res.json({ batchId: latest.batchId, status: latest.status });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
-app.post("/api/batches/:batchId/items/:videoId/retry", async (req,res)=>{ try { const batch=await loadBatch(batchDirFor(req.params.batchId)); if(activeBatches.has(req.params.batchId)) throw new Error("批次正在处理，请等待当前视频结束"); const ref=batch.items.find((item)=>item.videoId===req.params.videoId); if(!ref) throw new Error("批次中不存在该视频"); const itemPath=path.join(batchDirFor(req.params.batchId),"items",ref.videoId,"item.json"); const item=JSON.parse(await fsp.readFile(itemPath,"utf8")); if(item.status!=="failed" && !(item.removeSubtitles && item.status==="paused")) throw new Error("只能重试失败或暂停的视频"); requireSubtitleKey(item.removeSubtitles); void executeBatch(req.params.batchId,req.params.videoId); res.status(202).json({batchId:req.params.batchId,videoId:req.params.videoId,retried:true}); } catch(error){ res.status(400).json({error:error.message}); } });
+app.post("/api/batches/:batchId/items/:videoId/retry", async (req,res)=>{ try { const batch=await loadBatch(batchDirFor(req.params.batchId)); if(activeBatches.has(req.params.batchId)) throw new Error("批次正在处理，请等待当前视频结束"); const ref=batch.items.find((item)=>item.videoId===req.params.videoId); if(!ref) throw new Error("批次中不存在该视频"); const itemPath=path.join(batchDirFor(req.params.batchId),"items",ref.videoId,"item.json"); const item=JSON.parse(await fsp.readFile(itemPath,"utf8")); if(item.status!=="failed" && !(item.removeSubtitles && item.status==="paused")) throw new Error("只能重试失败或暂停的视频"); await assertBatchDetection(batchDirFor(req.params.batchId), batch, req.params.videoId); requireSubtitleKey(item.removeSubtitles); void executeBatch(req.params.batchId,req.params.videoId); res.status(202).json({batchId:req.params.batchId,videoId:req.params.videoId,retried:true}); } catch(error){ res.status(400).json({error:error.message}); } });
 
 app.get("/api/runs/:runId", async (req, res) => {
   try { res.json(await resultFor(req.params.runId)); }
@@ -330,7 +341,7 @@ async function executeSubtitleRun(runId) {
       thresholds: { threshold: run.threshold, minDurationSec: run.minDurationSec }, signal: controller.signal,
       onUpdate: async () => {} });
   } catch (error) {
-    await updateRun(runId, { status: "failed", stage: "processing_failed", error: serializeError(error).message });
+    if (error.code !== "SHOT_DETECTION_VERSION_MISMATCH") await updateRun(runId, { status: "failed", stage: "processing_failed", error: serializeError(error).message });
   } finally { runExecutions.delete(runId); resolveDone(); }
 }
 
@@ -339,6 +350,7 @@ app.post("/api/runs/:runId/resume", async (req, res) => {
     const run = await loadRun(req.params.runId);
     if (!run.removeSubtitles) throw new Error("此接口仅用于恢复去字幕拆分任务");
     if (run.status === "completed") return res.json({ runId: run.runId, status: run.status, active: false });
+    assertCurrentShotDetection(run);
     requireSubtitleKey(true);
     void executeSubtitleRun(run.runId);
     res.status(202).json({ runId: run.runId, resumed: true, active: true });
@@ -380,7 +392,7 @@ app.post("/api/runs", upload.single("video"), async (req, res) => {
     if (removeSubtitles) {
       if (autoName && !gemini) throw new Error("XINHANKR_API_KEY 未配置，无法执行自动命名");
       const queuedAt = new Date().toISOString();
-      await saveRun({ runId, removeSubtitles, subtitleProvider: "wuhen", subtitleOptions, workflow, sourceFilename: req.file.originalname, input,
+      await saveRun({ runId, shotDetectionVersion: SHOT_DETECTION_VERSION, removeSubtitles, subtitleProvider: "wuhen", subtitleOptions, workflow, sourceFilename: req.file.originalname, input,
         mode: autoName ? "ffmpeg-gemini-naming" : "ffmpeg-only", model: autoName ? model : null,
         threshold, minDurationSec, keepAudio, autoName, status: "queued", stage: "queued", createdAt: queuedAt, queuedAt, attempts: [] });
       void executeSubtitleRun(runId);
@@ -404,8 +416,9 @@ app.post("/api/runs", upload.single("video"), async (req, res) => {
 
 async function startNaming(req, res, resumed = false) {
   try {
-    if (!gemini) throw new Error("请先在 .env 中配置 XINHANKR_API_KEY 并重启服务");
     const run = await loadRun(req.params.runId);
+    assertCurrentShotDetection(run);
+    if (!gemini) throw new Error("请先在 .env 中配置 XINHANKR_API_KEY 并重启服务");
     if (run.removeSubtitles) {
       requireSubtitleKey(true);
       if (!runExecutions.has(run.runId)) {

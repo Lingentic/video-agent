@@ -4,13 +4,14 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createShotServer } from "../src/server.mjs";
+import { SHOT_DETECTION_VERSION } from "../src/shot-service.mjs";
 import { processBatchItem, subtitleSummary } from "../src/batch-service.mjs";
 
 const cropA = { x1: 0.1, y1: 0.7, x2: 0.9, y2: 0.8 };
 const cropB = { x1: 0.2, y1: 0.6, x2: 0.8, y2: 0.75 };
 const defaultCrop = { x1: 0.05, y1: 0.60, x2: 0.95, y2: 0.85 };
 const options = { model: "video_removal_std", method: "sel_area", rectNormalized: cropA };
-const shotResult = { shots: [{ shotId: "shot_001", startSec: 0, endSec: 1 }], durationSec: 1, shotDetectionVersion: "2-primary-threshold" };
+const shotResult = { shots: [{ shotId: "shot_001", startSec: 0, endSec: 1 }], durationSec: 1, shotDetectionVersion: SHOT_DETECTION_VERSION };
 
 async function waitFor(read, predicate) {
   let last;
@@ -196,9 +197,9 @@ test("retrying one paused video leaves a batch paused while another video is sti
       await fsp.mkdir(dir, { recursive: true });
       const input = path.join(dir, "input.mp4");
       await fsp.writeFile(input, "media");
-      await fsp.writeFile(path.join(dir, "item.json"), JSON.stringify({ ...ref, input, stage: ref.status, removeSubtitles: true, subtitleProvider: "wuhen", subtitleOptions: options, autoName: false }));
+      await fsp.writeFile(path.join(dir, "item.json"), JSON.stringify({ ...ref, shotDetectionVersion: SHOT_DETECTION_VERSION, input, stage: ref.status, removeSubtitles: true, subtitleProvider: "wuhen", subtitleOptions: options, autoName: false }));
     }
-    await fsp.writeFile(path.join(batchDir, "batch.json"), JSON.stringify({ batchId, status: "paused", removeSubtitles: true, items: refs }));
+    await fsp.writeFile(path.join(batchDir, "batch.json"), JSON.stringify({ batchId, shotDetectionVersion: SHOT_DETECTION_VERSION, status: "paused", removeSubtitles: true, items: refs }));
     assert.equal((await fx.post(`/api/batches/${batchId}/items/video_001/retry`)).status, 202);
     const result = await waitFor(() => fx.json(`/api/batches/${batchId}`), (value) => value.items[0].status === "completed" && !value.batch.active);
     assert.equal(result.batch.status, "paused");
@@ -221,7 +222,7 @@ test("downstream naming uses prepared clean file and legacy provider records can
     });
     assert.equal(result.status, "completed");
     assert.equal(splitCalls, 0);
-    const old = await processBatchItem({ runDir, item: { input, videoId: "video_002", removeSubtitles: true, subtitleOptions: options, subtitle: { provider: "zhiling", taskId: "old-paid-task" } }, thresholds: {}, onUpdate: async () => {}, subtitleService: async () => assert.fail("legacy paid task must not be resubmitted") });
+    const old = await processBatchItem({ runDir, item: { shotDetectionVersion: SHOT_DETECTION_VERSION, input, videoId: "video_002", removeSubtitles: true, subtitleOptions: options, subtitle: { provider: "zhiling", taskId: "old-paid-task" } }, thresholds: {}, onUpdate: async () => {}, subtitleService: async () => assert.fail("legacy paid task must not be resubmitted") });
     assert.equal(old.status, "failed");
     assert.match(old.error, /旧去字幕供应商/);
     assert.equal(await fsp.readFile(input, "utf8"), "input");
@@ -252,9 +253,110 @@ test("known cloud identity survives a private state save failure and is passed b
   try {
     const input=path.join(root,"input.mp4");await fsp.writeFile(input,"original");
     const safe={id:"job-1",provider:"wuhen",taskId:"paid-task-1",submittedAt:new Date().toISOString(),inputUrl:"secret-cap-url"};
-    const failed=await processBatchItem({runDir:root,item:{videoId:"video_001",input,removeSubtitles:true,subtitleProvider:"wuhen",subtitleOptions:options},thresholds:{},onUpdate:async()=>{},subtitleService:async()=>{throw Object.assign(new Error("persist failed"),{job:safe});}});
+    const failed=await processBatchItem({runDir:root,item:{shotDetectionVersion:SHOT_DETECTION_VERSION,videoId:"video_001",input,removeSubtitles:true,subtitleProvider:"wuhen",subtitleOptions:options},thresholds:{},onUpdate:async()=>{},subtitleService:async()=>{throw Object.assign(new Error("persist failed"),{job:safe});}});
     assert.equal(failed.subtitle.taskId,"paid-task-1");assert.equal(failed.subtitle.id,"job-1");assert.equal(failed.subtitle.inputUrl,undefined);
     await processBatchItem({runDir:root,item:failed,thresholds:{},onUpdate:async()=>{},subtitleService:async({recoveryJob})=>{assert.equal(recoveryJob.taskId,"paid-task-1");assert.equal(recoveryJob.id,"job-1");throw Error("keep paused without submitting");}});
     const record=JSON.parse(await fsp.readFile(path.join(root,"artifacts","error.json"),"utf8"));assert.equal(record.subtitle.taskId,"paid-task-1");assert.ok(!JSON.stringify(record).includes("secret-cap-url"));
   } finally {await fsp.rm(root,{recursive:true,force:true});}
+});
+
+test("HTTP recovery and naming reject historical versions without paid calls or changing history", async () => {
+  let calls = 0;
+  const forbidden = async () => { calls += 1; throw new Error("history must not execute"); };
+  const fx = await fixture({ gemini: {}, subtitleService: forbidden, videoProcessor: forbidden, namingService: forbidden });
+  const files = [];
+  const save = async (file, value) => { await fsp.mkdir(path.dirname(file), { recursive: true }); await fsp.writeFile(file, value); files.push([file, value]); };
+  const assertRejected = async (route) => {
+    const response = await fx.post(route);
+    assert.equal(response.status, 400, route);
+    assert.match((await response.json()).error, /版本不一致.*创建新任务/);
+  };
+  try {
+    for (const version of ["2-primary-threshold", undefined]) {
+      const suffix = version ? "old" : "missing";
+      for (const removeSubtitles of [true, false]) {
+        const runId = `run_${suffix}_${removeSubtitles ? "subtitle" : "naming"}`;
+        const artifacts = path.join(fx.runsDir, runId, "artifacts");
+        await save(path.join(artifacts, "run.json"), JSON.stringify({ runId, status: "failed", shotDetectionVersion: version, removeSubtitles, shots: [{ shotId: "shot_001" }] }));
+        await save(path.join(artifacts, "shot_labels_normalized.json"), "cached names");
+        await save(path.join(artifacts, "analysis_input_numbered.mp4"), "analysis");
+        await save(path.join(artifacts, "shot_segments", "shot_001.mp4"), "old clip");
+        if (removeSubtitles) await assertRejected(`/api/runs/${runId}/resume`);
+        await assertRejected(`/api/runs/${runId}/name`);
+        await assertRejected(`/api/runs/${runId}/resume-naming`);
+        assert.equal((await fx.json(`/api/runs/${runId}`)).run.status, "failed");
+      }
+      for (const batchVersion of [version, SHOT_DETECTION_VERSION]) {
+        const batchId = `batch_${suffix}_${batchVersion === SHOT_DETECTION_VERSION ? "item" : "batch"}`;
+        const batchDir = path.join(fx.runsDir, batchId);
+        await save(path.join(batchDir, "batch.json"), JSON.stringify({ batchId, status: "paused", removeSubtitles: true, shotDetectionVersion: batchVersion, items: [{ videoId: "video_001", status: "paused" }] }));
+        await save(path.join(batchDir, "items", "video_001", "item.json"), JSON.stringify({ videoId: "video_001", status: "paused", removeSubtitles: true, shotDetectionVersion: version }));
+        await save(path.join(batchDir, "items", "video_001", "artifacts", "shot_labels_normalized.json"), "batch cached names");
+        await assertRejected(`/api/batches/${batchId}/resume`);
+        await assertRejected(`/api/batches/${batchId}/items/video_001/retry`);
+        assert.equal((await fx.json(`/api/batches/${batchId}`)).batch.status, "paused");
+      }
+      const runId = `run_completed_${suffix}`;
+      await save(path.join(fx.runsDir, runId, "artifacts", "run.json"), JSON.stringify({ runId, status: "completed", removeSubtitles: true, shotDetectionVersion: version }));
+      assert.equal((await fx.json(`/api/runs/${runId}`)).run.status, "completed");
+      assert.equal((await fx.post(`/api/runs/${runId}/resume`)).status, 200);
+      const batchId = `batch_completed_${suffix}`;
+      await save(path.join(fx.runsDir, batchId, "batch.json"), JSON.stringify({ batchId, status: "completed", shotDetectionVersion: version, items: [] }));
+      assert.equal((await fx.json(`/api/batches/${batchId}`)).batch.status, "completed");
+    }
+    assert.equal(calls, 0);
+    for (const [file, value] of files) assert.equal(await fsp.readFile(file, "utf8"), value);
+  } finally { await fx.close(); }
+});
+
+test("completed current subtitle split tasks can explicitly add naming without redetecting", async () => {
+  let splitCalls = 0;
+  let namingCalls = 0;
+  const fx = await fixture({ gemini: {},
+    subtitleService: async ({ runDir }) => ({ outputPath: path.join(runDir, "clean.mp4"), job: { provider: "wuhen", taskId: "existing-completed-task" } }),
+    videoProcessor: async () => { splitCalls += 1; assert.fail("completed cut plan must not be redetected"); },
+    namingService: async ({ initialRun }) => {
+      namingCalls += 1;
+      assert.equal(initialRun.shotDetectionVersion, SHOT_DETECTION_VERSION);
+      assert.equal(path.basename(initialRun.processingInput), "clean.mp4");
+      return { manifest: [{ shotId: "shot_001" }], usage: {} };
+    },
+  });
+  try {
+    for (const action of ["name", "resume-naming"]) {
+      const runId = `run_completed_${action.replaceAll("-", "_")}`;
+      const runDir = path.join(fx.runsDir, runId);
+      await fsp.mkdir(path.join(runDir, "artifacts"), { recursive: true });
+      const input = path.join(runDir, "input.mp4");
+      await fsp.writeFile(input, "original input");
+      await fsp.writeFile(path.join(runDir, "clean.mp4"), "existing clean result");
+      await fsp.writeFile(path.join(runDir, "artifacts", "run.json"), JSON.stringify({
+        runId, input, status: "completed", stage: "completed", autoName: false, workflow: "ffmpeg_only",
+        removeSubtitles: true, subtitleProvider: "wuhen", subtitleOptions: options, threshold: 12, minDurationSec: 0.2, ...shotResult,
+      }));
+      const previousNamingCalls = namingCalls;
+      assert.equal((await fx.post(`/api/runs/${runId}/${action}`)).status, 202);
+      const result = await waitFor(() => fx.json(`/api/runs/${runId}`), (value) => value.run.status === "completed" && value.run.namedShotCount === 1 && !value.run.active);
+      assert.equal(result.run.autoName, true);
+      assert.equal(namingCalls - previousNamingCalls, 1);
+      assert.equal(splitCalls, 0);
+    }
+  } finally { await fx.close(); }
+});
+
+test("unconfigured naming still reports historical detection version before asking for a key", async () => {
+  const fx = await fixture({ gemini: false });
+  try {
+    const runId = "run_old_without_key";
+    const artifacts = path.join(fx.runsDir, runId, "artifacts");
+    await fsp.mkdir(artifacts, { recursive: true });
+    const record = JSON.stringify({ runId, status: "failed", shotDetectionVersion: "2-primary-threshold" });
+    await fsp.writeFile(path.join(artifacts, "run.json"), record);
+    for (const action of ["name", "resume-naming"]) {
+      const response = await fx.post(`/api/runs/${runId}/${action}`);
+      assert.equal(response.status, 400);
+      assert.match((await response.json()).error, /版本不一致.*创建新任务/);
+    }
+    assert.equal(await fsp.readFile(path.join(artifacts, "run.json"), "utf8"), record);
+  } finally { await fx.close(); }
 });

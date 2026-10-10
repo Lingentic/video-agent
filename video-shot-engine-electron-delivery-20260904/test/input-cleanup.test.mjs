@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { cleanupRunInputs, cleanupStaleInputs, FAILED_INPUT_RETENTION_MS } from "../src/input-cleanup.mjs";
+import { SHOT_DETECTION_VERSION } from "../src/shot-service.mjs";
 
 async function exists(file) {
   try { await fsp.access(file); return true; } catch { return false; }
@@ -42,7 +43,7 @@ test("cleans completed and expired failed inputs but keeps recent failed inputs 
       const output = path.join(runDir, "artifacts", "shot_segments", "shot_001.mp4");
       await fsp.mkdir(path.dirname(output), { recursive: true });
       await Promise.all([fsp.writeFile(input, "input"), fsp.writeFile(output, "output")]);
-      await fsp.writeFile(path.join(runDir, "artifacts", "run.json"), JSON.stringify({ runId: record.id, input, status: record.status, updatedAt: new Date(Date.now() - record.age).toISOString() }));
+      await fsp.writeFile(path.join(runDir, "artifacts", "run.json"), JSON.stringify({ runId: record.id, shotDetectionVersion: SHOT_DETECTION_VERSION, input, status: record.status, updatedAt: new Date(Date.now() - record.age).toISOString() }));
     }
     await cleanupStaleInputs(root);
     assert.equal(await exists(path.join(root, "run_completed", "input.mp4")), false);
@@ -68,4 +69,26 @@ test("cleans an expired orphan input regardless of its video extension", async (
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
   }
+});
+
+test("startup retention leaves all old or unversioned task inputs and analysis copies intact", async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "shot-history-retention-"));
+  try {
+    const sentinels = [];
+    for (const kind of ["run", "batch"]) for (const status of ["completed", "failed"]) for (const version of ["2-primary-threshold", undefined]) {
+      const id = `${kind}_${status}_${version ? "old" : "missing"}`;
+      const runDir = kind === "run" ? path.join(root, id) : path.join(root, id, "items", "video_001");
+      const artifacts = path.join(runDir, "artifacts");
+      await fsp.mkdir(artifacts, { recursive: true });
+      const input = path.join(runDir, "input.mp4");
+      const stateFile = kind === "run" ? path.join(artifacts, "run.json") : path.join(runDir, "item.json");
+      const record = JSON.stringify({ input, status, shotDetectionVersion: version, updatedAt: new Date(Date.now() - FAILED_INPUT_RETENTION_MS - 1000).toISOString() });
+      for (const [file, value] of [[stateFile, record], [input, "original input"], [path.join(artifacts, "analysis_input_numbered.mp4"), "analysis input"]]) {
+        await fsp.writeFile(file, value);
+        sentinels.push([file, value]);
+      }
+    }
+    await cleanupStaleInputs(root);
+    for (const [file, value] of sentinels) assert.equal(await fsp.readFile(file, "utf8"), value);
+  } finally { await fsp.rm(root, { recursive: true, force: true }); }
 });

@@ -1,6 +1,6 @@
 # 镜头切分与素材命名工具
 
-使用本地 FFmpeg/ffprobe 按 `scdet` 画面变化生成镜头候选，再由 `gemini-3.6-flash` 观看原视频并复核候选边界；Gemini 只返回最终边界、`content_title` 和剪辑用途 `usage_type`，不做语义分割或其他业务分析。
+使用本地 FFmpeg/ffprobe 按 `scdet` 画面变化固定镜头边界，再由 `gemini-3.6-flash` 观看编号分析副本命名。Gemini 只返回 `shot_id`、`content_title` 和剪辑用途 `usage_type`，不能改变边界或增删、合并镜头。
 
 ## 启动
 
@@ -10,13 +10,15 @@
 
 供应商固定为 xinhankr 的 Google 原生 `generateContent` 接口，使用 `thinkingBudget: 0`；未配置 Key 时，本地 FFmpeg 镜头切分仍可独立使用。
 
-结构化输出首选 Google 原生的 `generationConfig.responseJsonSchema` 与 `responseMimeType: application/json`。发送给网关的 Schema 只描述稳定字段、类型、必填项和用途枚举；精确镜头数量不使用第三方适配器兼容性不稳定的数组长度关键字，而由提示词和本地严格校验共同保证。本地同时校验镜头 ID 不缺失、不重复、候选边界属于对应镜头且最后覆盖视频结尾。兼容层只接受语义等价的 `{ "shots": [...] }` 和顶层 `[...]` 两种外壳，不猜测缺失字段。所有兼容重试都必须保留 `thinkingConfig: { "thinkingBudget": 0 }`。
+结构化输出首选 Google 原生的 `generationConfig.responseJsonSchema` 与 `responseMimeType: application/json`。发送给网关的 Schema 只描述稳定字段、类型、必填项和用途枚举；精确镜头数量不使用第三方适配器兼容性不稳定的数组长度关键字，而由提示词和本地严格校验共同保证。本地同时校验镜头 ID 不缺失、不重复，导出使用 FFmpeg 已固定的整数帧边界并覆盖视频结尾。兼容层只接受语义等价的 `{ "shots": [...] }` 和顶层 `[...]` 两种外壳，不猜测缺失字段。所有兼容重试都必须保留 `thinkingConfig: { "thinkingBudget": 0 }`。
 
-新版本运行记录默认写入独立的 `runs-v1/`。默认显著变化阈值为 `20`、最短镜头为 `0.2` 秒，正式镜头严格使用页面阈值；低阈值扫描只用于收集诊断候选，不能直接生成正式切片。FFmpeg 原始事件只合并相距不超过 2 帧的重复检测点，并保留其中分数最高者；FPS、帧窗口、原始候选和去重候选都保存在 `artifacts/scene_cuts.json`。运行根目录只保留 `input.*`、`named_segments/` 和内部产物目录 `artifacts/`；界面不列出任何单独片段，只显示拆分段数。
+新版本运行记录默认写入独立的 `runs-v1/`。服务函数默认显著变化阈值仍为 `20`，客户端提交任务的默认阈值仍为 `12`；最短镜头默认 `0.2` 秒。正式检测仅使用任务传入的一个阈值：FFmpeg 直接执行 `scdet=threshold=<任务阈值>`，不做低阈值预扫描或后续分数过滤，也不按固定帧窗口合并相邻事件。`planShots` 按时间顺序处理全部达标事件，只因距前一个已接受切点（或开头）不足最短镜头时长、或距视频结尾不足该时长而舍弃切点；不取最高分或移动到附近峰值。
+
+`artifacts/scene_cuts.json` 在切片导出前保存所有达标检测事件（`rawCuts` 与兼容字段 `candidateCuts` 内容相同），包括被最短镜头规则舍弃的事件，并记录 `minDurationSec`。兼容字段 `candidateThreshold` 等于任务阈值，`clusterWindowFrames` 为 `0`。检测版本为 `3-single-threshold`。切片继续按整数帧边界、指定帧数重新编码导出；本次规则仅消除合格事件被低分候选或固定窗口错误挤掉的问题，不保证已消除所有镜头边界定位误差。运行根目录只保留 `input.*`、`named_segments/` 和内部产物目录 `artifacts/`；界面不列出任何单独片段，只显示拆分段数。
 
 发送给 xinhankr 的不是原始大文件，而是最长边约束后的 480 宽、15 FPS、目标不超过约 7 MB 的编号分析副本，保留低码率音频；Base64 估算大小和上传方式保存在 `analysis_input_config.json` 与 `gemini_file_created.json`。最终切片始终从原始视频重新导出，不受分析副本画质影响。
 
-Gemini 提示词快照保存在每次运行的 `artifacts/naming_prompt_snapshot.txt`。第一版由 FFmpeg 固定镜头数量；每个切点只提供相距最多约 2 帧的真实候选，Gemini 只能选择每段的 `end_candidate_id`，不得新增、删除或合并镜头。程序自动以前一段终点作为后一段起点，保证全片连续。
+Gemini 提示词快照保存在每次运行的 `artifacts/naming_prompt_snapshot.txt`。FFmpeg 先固定镜头数量、编号和帧边界，Gemini 只命名，不返回或选择切点。程序沿用同一组边界导出每段，保证片段连续。
 
 ## 批量处理
 
@@ -29,3 +31,5 @@ Gemini 提示词快照保存在每次运行的 `artifacts/naming_prompt_snapshot
 页面显示每个视频的阶段、实际处理时间、输入/输出/总 Token、API 尝试次数、最终成功层级和错误；超时请求会提示费用未知。页面不列出原始片段或命名片段，只显示成功拆分段数；批次顶部提供 `catalog.csv` 下载。
 
 “恢复批次”只处理失败或未完成项，已完成视频跳过；每个失败视频还提供“重试此视频”，不会重跑同批其他视频。自动配额重试最多 3 次，不会无限等待。
+
+恢复与直接命名前必须核对检测版本。旧版本或缺失版本的未完成任务明确拒绝恢复，提示创建新任务；不重新检测、不删除旧片段或命名缓存，也不调用去字幕或 Gemini。新任务创建时即记录当前版本。已完成历史成果仍可查看；服务启动时的输入保留期清理也跳过旧版本和缺失版本的任务记录。

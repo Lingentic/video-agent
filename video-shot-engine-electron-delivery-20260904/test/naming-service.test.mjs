@@ -62,7 +62,7 @@ test("rejects empty titles and usage types outside the contract", () => {
 });
 
 test("creates a Windows-safe descriptive filename without sequence or usage label", () => {
-  const filename = createNamedFilename({ contentTitle: "杯盖:双饮口/展示", usageType: "功能讲解" }, 0, ".mp4");
+  const filename = createNamedFilename({ contentTitle: "杯盖:双饮口/展示", usageType: "功能讲解" }, ".mp4");
   assert.equal(filename, "杯盖 双饮口 展示.mp4");
   assert.equal(sanitizeFilenamePart("CON"), "CON_素材");
 });

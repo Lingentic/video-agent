@@ -1,6 +1,6 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { processVideo } from "./shot-service.mjs";
+import { processVideo, assertCurrentShotDetection } from "./shot-service.mjs";
 import { executeShotNaming } from "./naming-service.mjs";
 import { serializeError } from "./network.mjs";
 import { calculateCostYuan } from "./pricing.mjs";
@@ -59,6 +59,7 @@ export function subtitleSummary(job) {
 }
 
 export async function processBatchItem({ batchDir, runDir, stateFile, item, gemini, thresholds, onUpdate, signal, subtitleApiKey, subtitleService, videoProcessor = processVideo, namingService = executeShotNaming }) {
+  assertCurrentShotDetection(item);
   const itemDir = runDir || path.join(batchDir, "items", item.videoId);
   const artifactsDir = path.join(itemDir, "artifacts");
   await fsp.mkdir(artifactsDir, { recursive: true });
@@ -101,7 +102,7 @@ export async function processBatchItem({ batchDir, runDir, stateFile, item, gemi
       await update({ processingInput: subtitle.outputPath, originalMedia: subtitle.inputMedia, subtitleMedia: subtitle.outputMedia,
         subtitle: subtitleSummary(subtitle.job), subtitleDurationMs: Number(item.subtitleDurationMs || 0) + Date.now() - subtitleStartedAt });
     }
-    if (!item.shots || item.shotDetectionVersion !== "2-primary-threshold") {
+    if (!item.shots) {
       await fsp.rm(path.join(artifactsDir, "shot_segments"), { recursive: true, force: true });
       await fsp.rm(path.join(itemDir, "named_segments"), { recursive: true, force: true });
       for (const name of ["shot_labels_raw.json", "shot_labels_normalized.json", "rename_manifest.json", "gemini_response.json", "usage.json", "provider_attempts.json"]) await fsp.rm(path.join(artifactsDir, name), { force: true });

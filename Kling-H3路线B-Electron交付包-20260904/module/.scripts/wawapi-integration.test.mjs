@@ -12,8 +12,9 @@ for (const productCount of [1, 3]) test(`WawAPI edit (${productCount} product re
   const dir = await mkdtemp(path.join(os.tmpdir(), "waw-client-test-"));
   const serverPath = path.join(dir, "server.mjs");
   await copyFile(path.join(root, "server.mjs"), serverPath);
-  const source = path.resolve(root, "../../..", "video-agent-experiments/assets/source-scene.png");
-  const bytes = await readFile(source);
+  const source = path.join(dir, "source-scene.png");
+  const bytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+  await writeFile(source, bytes);
   let calls = 0, failAt = 2, received = [], gatewayAt = 0, badAt = 0;
   const provider = http.createServer(async (req, res) => {
     let chunks=[]; for await (const b of req) chunks.push(b);

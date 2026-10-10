@@ -61,6 +61,8 @@ const timers = new Map();
 let shotAssetsLoading = false;
 let klingAssetsLoading = false;
 let klingAssetsRevision = 0;
+const assetServiceInstances = new Map();
+let latestServices = [];
 let libraryExportBusy = false;
 const defaultSubtitleOptions = () => ({ model: "video_removal_std", method: "sel_area" });
 let latestBatchChecked = false;
@@ -2023,8 +2025,10 @@ async function loadShotAssets() {
     }
     sortLibraryNewestFirst();
     if (state.active === "library") render();
+    return true;
   } catch (error) {
     if (state.active === "library") notify(`素材库读取失败：${error.message}`);
+    return false;
   } finally { shotAssetsLoading = false; }
 }
 async function loadLatestInterruptedBatch() {
@@ -2131,14 +2135,51 @@ async function loadKlingAssets() {
     replaceKlingLibraryAssets(response);
     sortLibraryNewestFirst();
     if (state.active === "library") render();
-  } catch {} finally { klingAssetsLoading = false; }
+    return true;
+  } catch { return false; } finally { klingAssetsLoading = false; }
 }
 function replaceKlingLibraryAssets(response) {
   const assets = (response.assets || []).map(asset => ({ name: asset.name, url: new URL(asset.relativeUrl, response.baseUrl).toString(), kind: asset.kind === "image" ? "image" : "video", origin: "产品替换", remoteKey: `${asset.runId}:${asset.relativeUrl}`, runId: asset.runId, sourceId: asset.sourceId, sourceFolderName: asset.sourceFolderName, sourceFilename: asset.sourceFilename, workflow: "remake", voiceName: asset.voiceName, completedAt: asset.completedAt }));
   state.library = state.library.filter(item => !(item.remoteKey && (item.workflow === "remake" || item.origin === "产品替换")));
   state.library.push(...assets);
 }
-function showServices(services) { const ready = services.filter((service) => service.status === "ready").length; serviceStatus.textContent = ready === 2 ? "两个本地服务已就绪" : `${ready}/${services.length || 2} 个服务就绪`; serviceStatus.className = ready === 2 ? "ready" : services.some((service) => service.status === "error") ? "error" : ""; if (services.some((service) => service.key === "shot" && service.status === "ready")) { if (!state.split.config) void loadShotConfig(); void loadShotAssets(); void loadLatestInterruptedBatch(); } if (services.some((service) => service.key === "kling" && service.status === "ready")) { if (!state.remake.config) void loadKlingConfig(); void loadKlingAssets(); void loadLatestInterruptedRemake(); if (!state.remake.voices.length) void loadVoices(); } }
+function refreshServiceAssets(service, loadAssets) {
+  const identity = `${service.pid ?? ""}:${service.port ?? ""}`;
+  if (assetServiceInstances.get(service.key) === identity) return;
+  void loadAssets().then((loaded) => {
+    const current = latestServices.find((item) => item.key === service.key);
+    if (current?.status !== "ready") return;
+    const currentIdentity = `${current.pid ?? ""}:${current.port ?? ""}`;
+    if (currentIdentity === identity) {
+      if (loaded) assetServiceInstances.set(service.key, identity);
+    } else if (loaded !== undefined) {
+      // A restart during an in-flight scan still needs one scan of the new service.
+      refreshServiceAssets(current, loadAssets);
+    }
+  });
+}
+function showServices(services) {
+  latestServices = services;
+  const ready = services.filter((service) => service.status === "ready").length;
+  serviceStatus.textContent = ready === 2 ? "两个本地服务已就绪" : `${ready}/${services.length || 2} 个服务就绪`;
+  serviceStatus.className = ready === 2 ? "ready" : services.some((service) => service.status === "error") ? "error" : "";
+  for (const key of assetServiceInstances.keys()) {
+    if (!services.some((service) => service.key === key && service.status === "ready")) assetServiceInstances.delete(key);
+  }
+  for (const service of services) {
+    if (service.status !== "ready") continue;
+    if (service.key === "shot") {
+      if (!state.split.config) void loadShotConfig();
+      refreshServiceAssets(service, loadShotAssets);
+      void loadLatestInterruptedBatch();
+    } else if (service.key === "kling") {
+      if (!state.remake.config) void loadKlingConfig();
+      refreshServiceAssets(service, loadKlingAssets);
+      void loadLatestInterruptedRemake();
+      if (!state.remake.voices.length) void loadVoices();
+    }
+  }
+}
 if (uiPreviewMode === "folder-processing" || uiPreviewMode === "combined" || uiPreviewMode === "batch-split") {
   state.active = "split";
   state.split.batch = {

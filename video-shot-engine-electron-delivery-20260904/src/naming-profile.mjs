@@ -1,6 +1,6 @@
 const USAGE_TYPES = ["商品展示", "功能讲解", "使用演示", "效果展示", "人物口播", "开场钩子", "问题引入", "场景过渡", "结尾收束", "其他"];
 
-export function createNamingProfile(shots, durationSec, cuts = [], fps = 30) {
+export function createNamingProfile(shots, durationSec, fps = 30) {
   const manifest = shots.map((shot, index) => ({
     shot_id: shot.shotId,
     start_sec: Number(shot.startSec.toFixed(6)),

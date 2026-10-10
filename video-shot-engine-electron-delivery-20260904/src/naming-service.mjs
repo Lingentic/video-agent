@@ -69,7 +69,7 @@ export async function executeShotNaming({ runDir, initialRun, gemini, onStage, s
   let run = initialRun; const artifactsDir = path.join(runDir, "artifacts"); await fsp.mkdir(artifactsDir, { recursive: true }); const stage = async (name, patch = {}) => { signal?.throwIfAborted(); run = await onStage(name, patch); signal?.throwIfAborted(); return run; };
   const inputPath = run.processingInput || run.input;
   signal?.throwIfAborted();
-  const profile = createNamingProfile(run.shots, run.durationSec, run.cuts || [], run.fps || 30); await fsp.writeFile(path.join(artifactsDir, "naming_prompt_snapshot.txt"), profile.prompt, "utf8"); await writeJson(path.join(artifactsDir, "naming_schema_snapshot.json"), profile.schema); await writeJson(path.join(artifactsDir, "shot_manifest_for_gemini.json"), profile.manifest);
+  const profile = createNamingProfile(run.shots, run.durationSec, run.fps || 30); await fsp.writeFile(path.join(artifactsDir, "naming_prompt_snapshot.txt"), profile.prompt, "utf8"); await writeJson(path.join(artifactsDir, "naming_schema_snapshot.json"), profile.schema); await writeJson(path.join(artifactsDir, "shot_manifest_for_gemini.json"), profile.manifest);
   let raw; let result;
   try {
     raw = JSON.parse(await fsp.readFile(path.join(artifactsDir, "shot_labels_raw.json"), "utf8"));
@@ -122,9 +122,9 @@ export async function executeShotNaming({ runDir, initialRun, gemini, onStage, s
   await stage("naming_export"); const namedDir = path.join(runDir, "named_segments"); await fsp.mkdir(namedDir, { recursive: true }); const manifest = [];
   const fps = Math.max(1, Number(run.fps || 30));
   const usedFilenames = new Set();
-  for (const [index, label] of labels.entries()) {
+  for (const label of labels) {
     signal?.throwIfAborted();
-    const filename = createUniqueFilename(createNamedFilename(label, index, ".mp4"), usedFilenames);
+    const filename = createUniqueFilename(createNamedFilename(label, ".mp4"), usedFilenames);
     const output = path.join(namedDir, filename);
     const startFrame = Math.max(0, Math.round(label.startSec * fps));
     const endFrame = Math.max(startFrame + 1, Math.round(label.endSec * fps));

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
 
-const source = await readFile(new URL("../../../electron/renderer/app.js", import.meta.url), "utf8");
+const source = (await readFile(new URL("../../../electron/renderer/app.js", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
 const css = await readFile(new URL("../../../electron/renderer/remake.css", import.meta.url), "utf8");
 function fragment(start, end) {
   const first = source.indexOf(start);

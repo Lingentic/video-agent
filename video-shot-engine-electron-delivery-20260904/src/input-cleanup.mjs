@@ -1,5 +1,6 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { SHOT_DETECTION_VERSION } from "./shot-service.mjs";
 
 export const FAILED_INPUT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -55,6 +56,7 @@ export async function cleanupStaleInputs(runsDir, now = Date.now()) {
         if (await directoryTimestamp(dir) < cutoff) await cleanupOrphanInputs(dir);
         continue;
       }
+      if (run.shotDetectionVersion !== SHOT_DETECTION_VERSION) continue;
       if (run.status === "completed" || (["failed", "processing", "queued"].includes(run.status) && timestampOf(run) < cutoff)) {
         await cleanupRunInputs(dir, run.input, { preserveInput: run.removeSubtitles });
       }
@@ -69,6 +71,7 @@ export async function cleanupStaleInputs(runsDir, now = Date.now()) {
       const itemDir = path.join(itemsDir, itemEntry.name);
       const item = await readJson(itemDir, "item.json");
       if (!item) continue;
+      if (item.shotDetectionVersion !== SHOT_DETECTION_VERSION) continue;
       if (item.status === "completed" || (["failed", "processing", "queued"].includes(item.status) && timestampOf(item) < cutoff)) {
         await cleanupRunInputs(itemDir, item.input, { preserveInput: item.removeSubtitles });
       }

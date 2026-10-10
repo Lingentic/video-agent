@@ -16,7 +16,7 @@ export function sanitizeFilenamePart(value, fallback = "待确认", maxLength = 
   return [...result].slice(0, maxLength).join("").trim().replace(TRAILING_DOTS_OR_SPACES, "") || fallback;
 }
 
-export function createNamedFilename(label, index, sourcePath) {
+export function createNamedFilename(label, sourcePath) {
   const title = sanitizeFilenamePart(label.contentTitle, "内容待确认", 42);
   const extension = path.extname(sourcePath).toLowerCase() || ".mp4";
   return `${title}${extension}`;
