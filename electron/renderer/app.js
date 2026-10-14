@@ -415,6 +415,7 @@ function renderBatchStatus() {
 
 async function runSplitBatch({ resume = false, retryVideoId = null } = {}) {
   const item = state.split;
+  if (!resume && !retryVideoId && !item.running) item.removeSubtitles = false;
   const folderMode = item.sources.some((source) => source.folderId);
   if (item.running || (!resume && !retryVideoId && (!item.sources.length || (!folderMode && !item.removeSubtitles && item.sources.length < 2))) || ((resume || retryVideoId) && !item.runId)) return;
   if (!resume && !retryVideoId && item.removeSubtitles && !item.config?.subtitleConfigured) { notify("去字幕服务暂不可用，请联系维护者"); return; }
@@ -476,6 +477,7 @@ async function runSplitBatch({ resume = false, retryVideoId = null } = {}) {
 
 async function runSplit({ resumeNaming = false } = {}) {
   const item = state.split;
+  if (!resumeNaming && !item.running) item.removeSubtitles = false;
   if (!resumeNaming && (item.removeSubtitles || item.sources.length > 1 || item.sources.some((source) => source.folderId))) return runSplitBatch();
   if (item.running || !item.source) return;
   item.running = true;
@@ -1124,9 +1126,9 @@ function renderRemake() {
 }
 
 function subtitleStep(item, locked = false) {
-  const enabled = item.removeSubtitles === true;
+  const enabled = locked && item.removeSubtitles === true;
   const configured = state.split.config?.subtitleConfigured === true;
-  return step(3, "字幕", "拆分前处理整条视频", `${options("splitSubtitles", ["不去字幕", "去字幕"], enabled ? "去字幕" : "不去字幕", locked ? ["不去字幕", "去字幕"] : [])}${enabled ? `<div class="subtitle-service-note"><p>固定处理画面底部字幕，无需逐条框选。处理期间请保持客户端开启及网络连接；原片保留。</p>${!configured ? "<small>去字幕服务暂不可用，请联系维护者</small>" : ""}</div>` : ""}`);
+  return step(3, "字幕", "拆分前处理整条视频", `${options("splitSubtitles", ["不去字幕", "去字幕"], enabled ? "去字幕" : "不去字幕", locked ? ["不去字幕", "去字幕"] : ["去字幕"])}${enabled ? `<div class="subtitle-service-note"><p>固定处理画面底部字幕，无需逐条框选。处理期间请保持客户端开启及网络连接；原片保留。</p>${!configured ? "<small>去字幕服务暂不可用，请联系维护者</small>" : ""}</div>` : ""}`);
 }
 function batchProcessingRoute(batch, active) {
   const index = active ? /naming_prepare|ffmpeg_completed/.test(active.stage) ? 1 : /ffmpeg_processing/.test(active.stage) ? 0 : /naming|analysis|provider|quota/.test(active.stage) ? 2 : 3 : 3;
@@ -1549,6 +1551,7 @@ document.addEventListener("click", async (event) => {
   }
   const option = event.target.closest("[data-option]");
   if (option) {
+    if (option.disabled) return;
     if (option.dataset.option === "remakeDuration") {
       const value = Number.parseInt(option.dataset.value, 10);
       if (!Number.isFinite(value) || state.remake.duration === value) return;

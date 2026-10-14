@@ -36,10 +36,18 @@ test("tunnel reuses configured transport port and sends no API key to the public
   const blocked=Function("deps",`const {${Object.keys(deps)}}=deps;${part(main,"async function prepareSubtitleTunnel(","async function createShotRun(")};return prepareSubtitleTunnel;`)(deps);await assert.rejects(blocked(),/配置无痕/);
   assert.match(main,/credentials", "wuhen.key"/);assert.match(main,/env\.WUHEN_API_KEY = subtitleKey/);assert.match(main,/stopChild\(service.subtitleTunnel\?\.tunnelChild\)/);
 });
-test("client uses provisioned credentials and displays fixed processing without configuration or crop controls",()=>{
+test("client disables new subtitle selection and retains fixed processing details for historical tasks",()=>{
   const state={split:{config:{subtitleConfigured:true},sources:[{name:"one.mp4"},{name:"two.mp4"}]}};
-  const fn=Function("state","defaultSubtitleOptions","step","options",`${part(renderer,"function subtitleStep(","function batchProcessingRoute(")};return subtitleStep;`)(state,()=>({model:"video_removal_std",method:"sel_area"}),(_n,_title,_hint,content)=>content,(_id,values)=>values.join(" "));
-  const html=fn({removeSubtitles:true});assert.match(html,/固定处理画面底部字幕/);assert.doesNotMatch(html,/STD|PRO|处理模型|框选字幕|配置无痕|服务密钥|one\.mp4|two\.mp4/);
+  const renderOptions=vm.runInNewContext(`${renderer.match(/function options\([^\n]+/)[0]};options`);
+  const fn=Function("state","defaultSubtitleOptions","step","options",`${part(renderer,"function subtitleStep(","function batchProcessingRoute(")};return subtitleStep;`)(state,()=>({model:"video_removal_std",method:"sel_area"}),(_n,_title,_hint,content)=>content,renderOptions);
+  for(const previousValue of [false,true]) {
+    const choices=fn({removeSubtitles:previousValue});
+    assert.match(choices,/data-value="去字幕"[^>]*disabled/);
+    assert.match(choices,/data-value="不去字幕"[^>]*class="active"/);
+    assert.doesNotMatch(choices,/data-value="不去字幕"[^>]*disabled/);
+    assert.doesNotMatch(choices,/固定处理画面底部字幕/);
+  }
+  const html=fn({removeSubtitles:true},true);assert.match(html,/固定处理画面底部字幕/);assert.doesNotMatch(html,/STD|PRO|处理模型|框选字幕|配置无痕|服务密钥|one\.mp4|two\.mp4/);
   assert.doesNotMatch(renderer,/subtitleModel/);
   assert.doesNotMatch(renderer,/subtitle-config-open|subtitle-region-open|subtitleApiKey|openSubtitleConfig/);
   assert.match(main,/readEnvValue\(path\.join\(definition\.cwd, "\.env"\), "WUHEN_API_KEY"\)/);
