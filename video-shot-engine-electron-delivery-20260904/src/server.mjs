@@ -17,6 +17,9 @@ import { createWuhenService, validateWuhenOptions } from "./wuhen-service.mjs";
 import { createWuhenTransport } from "./wuhen-transport.mjs";
 
 export async function createShotServer(overrides = {}) {
+const startupStartedAt = Date.now();
+const reportStartup = (stage) => console.log(`[startup] ${stage} (${Date.now() - startupStartedAt}ms)`);
+reportStartup("dependencies_loaded");
 const app = express();
 const port = Number(overrides.port ?? process.env.PORT ?? 3141);
 const host = overrides.host || process.env.HOST || "127.0.0.1";
@@ -28,6 +31,7 @@ const model = process.env.XINHANKR_MODEL || "gemini-3.6-flash";
 const proxyConfigured = configureHttpsProxy(process.env.GEMINI_HTTPS_PROXY || "");
 const gemini = overrides.gemini ?? (apiKey ? createXinhankrService({ apiKey, model, baseUrl: process.env.XINHANKR_BASE_URL }) : null);
 const transportManager = overrides.transportManager || await createWuhenTransport({ runsDir });
+reportStartup("transport_ready");
 const subtitleService = overrides.subtitleService || createWuhenService({ transportManager }).removeVideoSubtitles;
 const itemServices = { subtitleService, videoProcessor: overrides.videoProcessor || processVideo, namingService: overrides.namingService || executeShotNaming };
 const activeNamingRuns = new Set();
@@ -46,7 +50,9 @@ const parseSubtitleOptions = (value) => {
 };
 
 await fsp.mkdir(uploadsDir, { recursive: true });
+reportStartup("input_cleanup_started");
 await cleanupStaleInputs(runsDir);
+reportStartup("input_cleanup_completed");
 const upload = multer({ dest: uploadsDir, limits: { fileSize: 500 * 1024 * 1024 }, defParamCharset: "utf8" });
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(publicDir));
@@ -437,7 +443,7 @@ app.post("/api/runs/:runId/resume-naming", (req, res) => startNaming(req, res, t
 
 return { app, transportManager, async listen() {
   return new Promise((resolve, reject) => {
-    const server = app.listen(port, host, () => resolve(server));
+    const server = app.listen(port, host, () => { reportStartup("listening"); resolve(server); });
     server.once("error", reject);
   });
 } };

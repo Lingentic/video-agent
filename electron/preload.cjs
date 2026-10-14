@@ -6,6 +6,8 @@ contextBridge.exposeInMainWorld("videoClient", {
   openWorkspace: (key) => ipcRenderer.invoke("open-workspace", key),
   goHome: () => ipcRenderer.invoke("go-home"),
   openLogs: () => ipcRenderer.invoke("open-logs"),
+  exportDiagnostics: () => ipcRenderer.invoke("export-diagnostics"),
+  reportDiagnostic: (details) => ipcRenderer.send("diagnostics-event", details),
   getKlingConfig: () => ipcRenderer.invoke("kling-get-config"),
   listKlingAssets: () => ipcRenderer.invoke("kling-list-assets"),
   getLatestRecoverableKlingRun: () => ipcRenderer.invoke("kling-get-latest-recoverable"),

@@ -6,6 +6,8 @@ import { createServer } from "node:net";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import os from "node:os";
+import { createDiagnostics } from "./diagnostics.mjs";
 
 const execFileAsync = promisify(execFile);
 const productName = "章域·视频混剪智能体";
@@ -61,10 +63,84 @@ const serviceDefinitions = {
 };
 
 const services = new Map();
+const diagnostics = createDiagnostics({
+  dataRoot: clientDataRoot,
+  metadata: { version: app.getVersion(), platform: process.platform, arch: process.arch, osRelease: os.release(), electron: process.versions.electron, node: process.versions.node, packaged: app.isPackaged },
+  privatePaths: [app.getPath("home"), projectRoot, resourceRoot, clientDataRoot]
+});
 let mainWindow;
 let stopping = false;
+let diagnosticExportPending = false;
 const quickTunnelMaxAttempts = 4;
 const quickTunnelRetryDelaysMs = [0, 1200, 2400, 4000];
+
+async function loadDiagnosticSecrets() {
+  const secretValues = [];
+  for (const [key, value] of Object.entries(process.env)) {
+    if (/(?:API_KEY|TOKEN|SECRET|PASSWORD|ACCESS_KEY)/i.test(key) && value) secretValues.push(value);
+  }
+  for (const definition of Object.values(serviceDefinitions)) {
+    try {
+      const content = await readFile(path.join(definition.cwd, ".env"), "utf8");
+      for (const line of content.split(/\r?\n/)) {
+        const match = line.match(/^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.*?)\s*$/);
+        if (match && /(?:API_KEY|TOKEN|SECRET|PASSWORD|ACCESS_KEY)/i.test(match[1])) {
+          const value = match[2].replace(/^(['"])(.*)\1$/, "$2");
+          if (value) secretValues.push(value);
+        }
+      }
+    } catch {}
+  }
+  try { const key = await readSubtitleCredential(); if (key) secretValues.push(key); } catch {}
+  diagnostics.setSecrets(secretValues);
+}
+
+function diagnosticError(error) {
+  return { name: error?.name, message: error?.message || String(error), code: error?.code, stack: error?.stack, cause: error?.cause ? { name: error.cause.name, message: error.cause.message, code: error.cause.code } : undefined };
+}
+
+async function diagnosticJsonRequest(module, endpoint, url, options, fallbackError) {
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(url, options);
+    const body = await response.json().catch(() => ({}));
+    const run = body?.run || body?.batch || body || {};
+    const configuration = endpoint === "api/config" ? { ready: body?.configured, namingReady: body?.apiKeyConfigured, subtitleReady: body?.subtitleConfigured, model: body?.model, imageModel: body?.imageModel, videoModel: body?.videoModel } : undefined;
+    void diagnostics.record("request.completed", { module, endpoint, method: options?.method || "GET", httpStatus: response.status, durationMs: Date.now() - startedAt, runId: run.id || run.runId || body?.runId || body?.batchId, stage: run.stage, status: run.status, requestId: body?.request_id || response.headers.get("x-request-id"), cloudTaskId: run.videoTaskId, configuration });
+    const failedItems = (Array.isArray(body?.items) ? body.items : Array.isArray(run.items) ? run.items : [])
+      .filter(item => String(item.status).toLowerCase() === "failed" || item.error || item.namingError)
+      .map(item => ({ videoId: item.videoId, stage: item.stage, failedStage: item.failedStage, status: item.status, failedAt: item.updatedAt || item.finishedAt,
+        error: item.error, namingError: item.namingError, errorRecord: item.errorRecord ? diagnosticError(item.errorRecord) : undefined }));
+    if (response.ok && (String(run.status).toLowerCase() === "failed" || run.error || run.namingError || failedItems.length)) {
+      void diagnostics.record("task.failed", { module, endpoint, runId: run.id || run.runId || run.batchId || body?.runId || body?.batchId,
+        stage: run.stage, status: run.status, failedAt: run.updatedAt || run.finishedAt, error: run.error || run.message, namingError: run.namingError, cloudTaskId: run.videoTaskId, failedItems }, "error");
+    }
+    if (!response.ok) throw new Error(body.error || body.message || body.code || `${fallbackError}：HTTP ${response.status}`);
+    return body;
+  } catch (error) {
+    void diagnostics.record("request.failed", { module, endpoint, durationMs: Date.now() - startedAt, error: diagnosticError(error) }, "error");
+    throw error;
+  }
+}
+
+function handleClientIpc(channel, handler) {
+  const tracked = /^(?:kling-(?:create|start|resume|retry|stop)|voice-(?:create|delete|revoice)|shot-(?:create|resume|retry|cancel)|library-export)/.test(channel);
+  ipcMain.handle(channel, async (...args) => {
+    const startedAt = Date.now();
+    if (tracked) void diagnostics.record("operation.started", { channel });
+    try {
+      const result = await handler(...args);
+      if (tracked) {
+        const run = result?.run || result?.batch || result;
+        void diagnostics.record("operation.completed", { channel, durationMs: Date.now() - startedAt, runId: run?.id || result?.runId || result?.batchId, stage: run?.stage, status: run?.status });
+      }
+      return result;
+    } catch (error) {
+      void diagnostics.record("operation.failed", { channel, durationMs: Date.now() - startedAt, error: diagnosticError(error) }, "error");
+      throw error;
+    }
+  });
+}
 
 function findFreePort() {
   return new Promise((resolve, reject) => {
@@ -77,20 +153,24 @@ function findFreePort() {
   });
 }
 
-async function waitForHealth(baseUrl, healthPath, timeoutMs = 10000) {
+async function waitForHealth(baseUrl, healthPath, timeoutMs = 10000, signal) {
   const startedAt = Date.now();
   let lastError = "服务尚未响应";
   while (Date.now() - startedAt < timeoutMs) {
+    signal?.throwIfAborted();
     try {
       const remainingMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
-      const response = await fetch(`${baseUrl}${healthPath}`, { signal: AbortSignal.timeout(Math.min(2500, remainingMs)) });
+      const requestTimeout = AbortSignal.timeout(Math.min(2500, remainingMs));
+      const response = await fetch(`${baseUrl}${healthPath}`, { signal: signal ? AbortSignal.any([signal, requestTimeout]) : requestTimeout });
       if (response.ok) return await response.json();
       lastError = `HTTP ${response.status}`;
     } catch (error) {
+      signal?.throwIfAborted();
       lastError = error.message;
     }
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
+  signal?.throwIfAborted();
   throw new Error(`${lastError}（等待 ${timeoutMs}ms）`);
 }
 
@@ -160,6 +240,7 @@ function startQuickTunnel(service, timeoutMs = 45000) {
       output = `${output}${text}`.slice(-12000);
       service.output.push(`[tunnel] ${text.trim()}`);
       service.output = service.output.slice(-80);
+      void diagnostics.record("tunnel.output", { module: service.key, message: text });
       const match = output.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
       if (match) discoveredUrl = match[0].replace(/\/$/, "");
       if (/Registered tunnel connection/i.test(output)) registered = true;
@@ -249,9 +330,7 @@ function getReadyShotService() {
 
 async function shotRequest(pathname, options = {}) {
   const service = getReadyShotService();
-  const response = await fetch(new URL(pathname, serviceUrl(service)), options);
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error || `镜头切分服务请求失败：HTTP ${response.status}`);
+  const body = await diagnosticJsonRequest("shot", pathname.split("?")[0], new URL(pathname, serviceUrl(service)), options, "镜头切分服务请求失败");
   return { ...body, baseUrl: serviceUrl(service) };
 }
 
@@ -365,9 +444,7 @@ function getReadyKlingService() {
 
 async function klingRequest(pathname, options = {}) {
   const service = getReadyKlingService();
-  const response = await fetch(new URL(pathname, serviceUrl(service)), options);
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error || `商品替换服务请求失败：HTTP ${response.status}`);
+  const body = await diagnosticJsonRequest("remake", pathname.split("?")[0], new URL(pathname, serviceUrl(service)), options, "商品替换服务请求失败");
   return { ...body, baseUrl: serviceUrl(service) };
 }
 
@@ -659,13 +736,11 @@ async function resolveVoice(voiceId) {
 async function dashscopeRequest(pathname, payload) {
   const key = await voiceApiKey();
   if (!key) throw new Error("声音服务尚未配置阿里云百炼 API Key");
-  const response = await fetch(`${dashscopeApiBase}/${pathname}`, {
+  const body = await diagnosticJsonRequest("voice", pathname, `${dashscopeApiBase}/${pathname}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: JSON.stringify(payload)
-  });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.message || body.code || `声音服务请求失败：HTTP ${response.status}`);
+  }, "声音服务请求失败");
   return body;
 }
 
@@ -1122,6 +1197,10 @@ async function startService(key) {
   }
 
   const service = { key, definition, port, status: "starting", error: null, output: [] };
+  const startupController = new AbortController();
+  const startupStartedAt = Date.now();
+  service.startupController = startupController;
+  void diagnostics.record("service.starting", { module: key, port });
   const child = spawn(process.execPath, [definition.entry], {
     cwd: definition.cwd,
     env,
@@ -1130,35 +1209,45 @@ async function startService(key) {
   });
   service.child = child;
   services.set(key, service);
-  const capture = (chunk) => {
+  const capture = (chunk, stream) => {
     service.output.push(String(chunk).trim());
     service.output = service.output.slice(-80);
+    void diagnostics.record("service.output", { module: key, stream, message: String(chunk) });
   };
-  child.stdout.on("data", capture);
-  child.stderr.on("data", capture);
+  child.stdout.on("data", (chunk) => capture(chunk, "stdout"));
+  child.stderr.on("data", (chunk) => capture(chunk, "stderr"));
   child.once("error", (error) => {
+    startupController.abort(error);
     service.status = "error";
     service.error = error.message;
+    void diagnostics.record("service.error", { module: key, error: diagnosticError(error) }, "error");
   });
   child.once("exit", (code, signal) => {
-    if (!stopping && service.status !== "ready") {
+    const expected = stopping || Boolean(service.expectedStop);
+    void diagnostics.record("service.exited", { module: key, code, signal, expected }, expected ? "info" : "error");
+    if (!expected && service.status !== "ready") {
       service.status = "error";
       service.error = `进程退出：code=${code ?? "null"}, signal=${signal ?? "null"}`;
-    } else if (!stopping) {
+      startupController.abort(new Error(service.error));
+    } else if (!expected) {
       service.status = "stopped";
     }
     notifyStatus();
   });
 
   try {
-    await waitForHealth(`http://127.0.0.1:${port}`, definition.healthPath);
+    // Local cold starts can involve dependency loading and historical input cleanup.
+    // Keep the public tunnel's shorter budgets unchanged; fail early on child exit.
+    await waitForHealth(`http://127.0.0.1:${port}`, definition.healthPath, 30000, startupController.signal);
     service.status = "ready";
+    void diagnostics.record("service.ready", { module: key, port, durationMs: Date.now() - startupStartedAt });
     notifyStatus();
     if (key === "kling") {
       void ensureQuickTunnel(service, { freshAttemptsAfterSharedFailure: false }).then(notifyStatus).catch((error) => {
         service.tunnelError = error.message;
         service.tunnelUrl = null;
         service.output.push(`[tunnel] ${error.message}`);
+        void diagnostics.record("tunnel.failed", { module: key, error: diagnosticError(error) }, "error");
         notifyStatus();
       });
     }
@@ -1166,7 +1255,10 @@ async function startService(key) {
   } catch (error) {
     service.status = "error";
     service.error = error.message;
+    void diagnostics.record("service.start_failed", { module: key, durationMs: Date.now() - startupStartedAt, error: diagnosticError(error) }, "error");
     await stopService(service);
+    service.status = "error";
+    service.error = error.message;
     throw new Error(`${definition.label} 启动失败：${error.message}`);
   }
 }
@@ -1188,6 +1280,8 @@ async function stopChild(child) {
 
 async function stopService(service) {
   if (!service) return;
+  service.expectedStop = true;
+  service.startupController?.abort(new Error("服务启动已中止"));
   service.status = "stopping";
   await Promise.all([stopChild(service.tunnelChild), stopChild(service.subtitleTunnel?.tunnelChild), stopChild(service.child)]);
 }
@@ -1236,11 +1330,17 @@ function createMainWindow() {
       void loadRenderer().then(() => mainWindow.setTitle(productName));
     }
   });
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    void diagnostics.record("renderer.process_gone", { reason: details.reason, exitCode: details.exitCode }, "error");
+  });
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, _url, isMainFrame) => {
+    if (isMainFrame) void diagnostics.record("renderer.load_failed", { errorCode, message: errorDescription }, "error");
+  });
   return loadRenderer();
 }
 
-ipcMain.handle("get-services", () => [...services.values()].map(serializeService));
-ipcMain.handle("start-services", async () => {
+handleClientIpc("get-services", () => [...services.values()].map(serializeService));
+handleClientIpc("start-services", async () => {
   const results = [];
   for (const key of Object.keys(serviceDefinitions)) {
     try {
@@ -1252,51 +1352,92 @@ ipcMain.handle("start-services", async () => {
   notifyStatus();
   return results;
 });
-ipcMain.handle("open-workspace", (_event, key) => openWorkspace(key));
-ipcMain.handle("kling-get-config", () => getKlingConfig());
-ipcMain.handle("kling-list-assets", () => listKlingAssets());
-ipcMain.handle("kling-get-latest-recoverable", () => getLatestRecoverableKlingRun());
-ipcMain.handle("kling-create-run", (_event, payload) => createKlingRun(payload || {}));
-ipcMain.handle("kling-get-run", (_event, runId) => klingRequest(`api/runs/${encodeURIComponent(runId)}`));
-ipcMain.handle("kling-start-video", (_event, runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit, voiceEnabled, voiceId) => startKlingVideo(runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit, voiceEnabled, voiceId));
-ipcMain.handle("kling-inspect-reference-audio", (_event, videoPath) => inspectReferenceAudio(videoPath));
-ipcMain.handle("kling-resume-run", (_event, runId) => resumeKlingRun(runId));
-ipcMain.handle("kling-stop-run", (_event, runId, stage) => stopKlingRun(runId, stage));
-ipcMain.handle("kling-retry-image", (_event, runId, indexes, continueOnly) => retryKlingImage(runId, indexes, continueOnly));
-ipcMain.handle("voice-list", () => listVoices());
-ipcMain.handle("voice-create", (_event, payload) => createVoice(payload || {}));
-ipcMain.handle("voice-delete", (_event, voiceId) => deleteVoice(voiceId));
-ipcMain.handle("voice-revoice-video", (_event, payload) => revoiceVideo(payload || {}));
-ipcMain.handle("shot-get-config", () => shotRequest("api/config"));
-ipcMain.handle("shot-configure-subtitles", (_event, apiKey) => configureSubtitles(apiKey));
-ipcMain.handle("shot-list-assets", () => listShotAssets());
-ipcMain.handle("library-export-task", (_event, payload) => exportLibraryTask(payload));
-ipcMain.handle("shot-pick-folders", () => pickShotFolders());
-ipcMain.handle("shot-create-run", (_event, payload) => createShotRun(payload || {}));
-ipcMain.handle("shot-create-batch", (_event, payload) => createShotBatch(payload || {}));
-ipcMain.handle("shot-get-run", (_event, runId) => shotRequest(`api/runs/${validateRunId(runId)}`));
-ipcMain.handle("shot-resume-naming", (_event, runId) => shotRequest(`api/runs/${validateRunId(runId)}/resume-naming`, { method: "POST" }));
-ipcMain.handle("shot-get-latest", () => getLatestShotRun());
-ipcMain.handle("shot-get-batch", (_event, batchId) => shotRequest(`api/batches/${validateBatchId(batchId)}`));
-ipcMain.handle("shot-cancel-batch", (_event, batchId) => shotRequest(`api/batches/${validateBatchId(batchId)}/cancel`, { method: "POST" }));
-ipcMain.handle("shot-resume-batch", (_event, batchId) => resumeShotBatch(batchId));
-ipcMain.handle("shot-retry-batch-item", (_event, batchId, videoId) => resumeShotBatch(batchId, videoId));
-ipcMain.handle("go-home", () => {
+handleClientIpc("open-workspace", (_event, key) => openWorkspace(key));
+handleClientIpc("kling-get-config", () => getKlingConfig());
+handleClientIpc("kling-list-assets", () => listKlingAssets());
+handleClientIpc("kling-get-latest-recoverable", () => getLatestRecoverableKlingRun());
+handleClientIpc("kling-create-run", (_event, payload) => createKlingRun(payload || {}));
+handleClientIpc("kling-get-run", (_event, runId) => klingRequest(`api/runs/${encodeURIComponent(runId)}`));
+handleClientIpc("kling-start-video", (_event, runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit, voiceEnabled, voiceId) => startKlingVideo(runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit, voiceEnabled, voiceId));
+handleClientIpc("kling-inspect-reference-audio", (_event, videoPath) => inspectReferenceAudio(videoPath));
+handleClientIpc("kling-resume-run", (_event, runId) => resumeKlingRun(runId));
+handleClientIpc("kling-stop-run", (_event, runId, stage) => stopKlingRun(runId, stage));
+handleClientIpc("kling-retry-image", (_event, runId, indexes, continueOnly) => retryKlingImage(runId, indexes, continueOnly));
+handleClientIpc("voice-list", () => listVoices());
+handleClientIpc("voice-create", (_event, payload) => createVoice(payload || {}));
+handleClientIpc("voice-delete", (_event, voiceId) => deleteVoice(voiceId));
+handleClientIpc("voice-revoice-video", (_event, payload) => revoiceVideo(payload || {}));
+handleClientIpc("shot-get-config", () => shotRequest("api/config"));
+handleClientIpc("shot-configure-subtitles", (_event, apiKey) => configureSubtitles(apiKey));
+handleClientIpc("shot-list-assets", () => listShotAssets());
+handleClientIpc("library-export-task", (_event, payload) => exportLibraryTask(payload));
+handleClientIpc("shot-pick-folders", () => pickShotFolders());
+handleClientIpc("shot-create-run", (_event, payload) => createShotRun(payload || {}));
+handleClientIpc("shot-create-batch", (_event, payload) => createShotBatch(payload || {}));
+handleClientIpc("shot-get-run", (_event, runId) => shotRequest(`api/runs/${validateRunId(runId)}`));
+handleClientIpc("shot-resume-naming", (_event, runId) => shotRequest(`api/runs/${validateRunId(runId)}/resume-naming`, { method: "POST" }));
+handleClientIpc("shot-get-latest", () => getLatestShotRun());
+handleClientIpc("shot-get-batch", (_event, batchId) => shotRequest(`api/batches/${validateBatchId(batchId)}`));
+handleClientIpc("shot-cancel-batch", (_event, batchId) => shotRequest(`api/batches/${validateBatchId(batchId)}/cancel`, { method: "POST" }));
+handleClientIpc("shot-resume-batch", (_event, batchId) => resumeShotBatch(batchId));
+handleClientIpc("shot-retry-batch-item", (_event, batchId, videoId) => resumeShotBatch(batchId, videoId));
+handleClientIpc("go-home", () => {
   if (!mainWindow || mainWindow.isDestroyed()) throw new Error("主窗口不可用");
   return loadRenderer().then(() => mainWindow.setTitle(productName));
 });
-ipcMain.handle("open-logs", async () => {
+handleClientIpc("open-logs", async () => {
   await mkdir(clientDataRoot, { recursive: true });
   const error = await shell.openPath(clientDataRoot);
   if (error) throw new Error(error);
   return clientDataRoot;
 });
 
+handleClientIpc("export-diagnostics", async () => {
+  if (diagnosticExportPending) throw new Error("诊断日志正在导出，请稍候");
+  diagnosticExportPending = true;
+  try {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const selection = await dialog.showSaveDialog(mainWindow, {
+      title: "导出诊断日志",
+      defaultPath: path.join(app.getPath("desktop"), `章域诊断日志-${stamp}.zip`),
+      filters: [{ name: "诊断日志压缩包", extensions: ["zip"] }]
+    });
+    if (selection.canceled || !selection.filePath) return { canceled: true };
+    await loadDiagnosticSecrets();
+    await diagnostics.record("diagnostics.export_requested", { services: [...services.values()].map(({ key, status, port }) => ({ key, status, port })) });
+    const result = await diagnostics.exportBundle(selection.filePath, { services: [...services.values()].map(serializeService) });
+    void diagnostics.record("diagnostics.export_completed", { fileCount: result.fileCount, taskCount: result.taskCount });
+    shell.showItemInFolder(result.path);
+    return { canceled: false, path: result.path, fileCount: result.fileCount, taskCount: result.taskCount, warningCount: result.warnings?.length || 0 };
+  } finally {
+    diagnosticExportPending = false;
+  }
+});
+
+ipcMain.on("diagnostics-event", (event, payload) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents || !payload || typeof payload !== "object") return;
+  const fields = {};
+  for (const key of ["module", "runId", "stage", "message", "stack", "code"]) {
+    if (typeof payload[key] === "string") fields[key] = payload[key].slice(0, 16384);
+  }
+  void diagnostics.record("renderer.error", fields, "error");
+});
+
+process.on("uncaughtExceptionMonitor", (error) => {
+  void diagnostics.record("client.uncaught_exception", { error: diagnosticError(error) }, "error");
+});
+
 app.whenReady().then(async () => {
+  await loadDiagnosticSecrets();
+  void diagnostics.record("client.started");
   app.setAppUserModelId("ai.zhangyu.video-mix-agent");
   await ensureBuiltinVoices();
   await createMainWindow();
   if (!uiPreviewMode) void startServices();
+}).catch(async (error) => {
+  await diagnostics.record("client.start_failed", { error: diagnosticError(error) }, "error");
+  dialog.showErrorBox("客户端启动失败", `客户端未能正常启动，请联系维护者并提供诊断日志。\n日志位置：${path.join(clientDataRoot, "diagnostics")}`);
+  app.quit();
 });
 
 async function startServices() {
@@ -1316,7 +1457,11 @@ app.on("before-quit", (event) => {
   if (stopping) return;
   event.preventDefault();
   stopping = true;
-  void Promise.all([...services.values()].map(stopService)).finally(() => app.exit(0));
+  void Promise.all([...services.values()].map(stopService)).finally(async () => {
+    await diagnostics.record("client.stopped");
+    await diagnostics.flush();
+    app.exit(0);
+  });
 });
 
 app.on("window-all-closed", () => {

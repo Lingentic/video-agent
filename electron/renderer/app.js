@@ -10,6 +10,8 @@ const videoClient = window.videoClient || {
   getServices: async () => [],
   openWorkspace: async () => notify("浏览器预览模式下不启动本地服务"),
   openLogs: async () => notify("浏览器预览模式下没有运行目录"),
+  exportDiagnostics: async () => { throw new Error("浏览器预览模式下不能导出客户端诊断日志"); },
+  reportDiagnostic: () => {},
   getKlingConfig: async () => ({ configured: false }),
   listKlingAssets: async () => ({ baseUrl: "", assets: [] }),
   getLatestRecoverableKlingRun: async () => ({ run: null, baseUrl: "" }),
@@ -2004,6 +2006,28 @@ window.addEventListener("resize", () => {
   resizeFrame = requestAnimationFrame(markOverflowingNames);
 });
 document.querySelector("#openLogs").addEventListener("click", async () => { try { await videoClient.openLogs(); } catch (error) { notify(`运行目录打开失败：${error.message}`); } });
+document.querySelector("#exportDiagnostics")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  if (button.disabled) return;
+  button.disabled = true;
+  button.textContent = "正在导出…";
+  try {
+    const result = await videoClient.exportDiagnostics();
+    if (!result.canceled) notify(result.warningCount ? "诊断日志已导出，部分旧记录无法读取；请将压缩包发给维护者" : "诊断日志已导出，请将压缩包发给维护者");
+  } catch (error) {
+    notify("诊断日志导出失败，请换一个可写入的位置再试");
+    try { videoClient.reportDiagnostic?.({ module: "diagnostics", message: cleanRemoteError(error), stack: error?.stack }); } catch {}
+  } finally {
+    button.disabled = false;
+    button.textContent = "导出诊断日志";
+  }
+});
+window.addEventListener("error", (event) => {
+  try { videoClient.reportDiagnostic?.({ module: state.active, message: event.message, stack: event.error?.stack }); } catch {}
+});
+window.addEventListener("unhandledrejection", (event) => {
+  try { videoClient.reportDiagnostic?.({ module: state.active, message: cleanRemoteError(event.reason), stack: event.reason?.stack }); } catch {}
+});
 async function loadShotConfig() {
   try {
     state.split.config = await videoClient.getShotConfig();
