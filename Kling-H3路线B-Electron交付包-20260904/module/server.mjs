@@ -27,6 +27,8 @@ const KLING_API_BASE = (process.env.KLING_API_BASE || "https://api-singapore.kli
 const BAILIAN_API_BASE = (process.env.BAILIAN_API_BASE || "https://dashscope.aliyuncs.com").replace(/\/$/, "");
 const BAILIAN_IMAGE_MODEL = process.env.BAILIAN_IMAGE_MODEL || "kling/kling-v3-omni-image-generation";
 const BAILIAN_IMAGE_RESOLUTION = process.env.BAILIAN_IMAGE_RESOLUTION || "1k";
+const BAILIAN_IMAGE_API_BASE = (process.env.BAILIAN_IMAGE_API_BASE || BAILIAN_API_BASE).replace(/\/$/, "");
+const BAILIAN_IMAGE_POLL_MS = Math.max(20, Number(process.env.BAILIAN_IMAGE_POLL_MS) || 5000);
 const KLING_VIDEO_OMNI_MODEL = process.env.KLING_VIDEO_OMNI_MODEL || "kling-3.0-omni";
 const H3_API_BASE = (process.env.XINHANKR_API_BASE || "https://token.xinhankr.com").replace(/\/$/, "");
 const H3_OPEN_MODEL = process.env.XINHANKR_H3_OPEN_MODEL || "MiniMax-H3";
@@ -115,6 +117,7 @@ function publicRun(run) {
     sourceVideo: publicMedia(run.sourceVideo),
     productImage: publicMedia(run.productImage),
     productImages: run.productImages.map(publicMedia),
+    fallbackProductImages: undefined,
     voiceAudio: publicMedia(run.voiceAudio),
     firstFrame: publicMedia(run.firstFrame),
     editedImage: publicMedia(run.editedImage),
@@ -162,7 +165,7 @@ function claimRunSubmission(...runsToClaim) {
 }
 
 function indexRunMedia(run) {
-  for (const item of [run.sourceVideo, ...(run.productImages || []), run.voiceAudio, run.firstFrame, run.editedImage, ...(run.keyframes || []), ...(run.editedKeyframes || []), ...(run.imageTasks || []).map((task) => task.editedImage), run.output]) {
+  for (const item of [run.sourceVideo, ...(run.productImages || []), ...(run.fallbackProductImages || []), run.voiceAudio, run.firstFrame, run.editedImage, ...(run.keyframes || []), ...(run.editedKeyframes || []), ...(run.imageTasks || []).map((task) => task.editedImage), run.output]) {
     if (item?.id && item?.path && !item.localDeletedAt) media.set(item.id, item);
   }
 }
@@ -608,23 +611,135 @@ async function removeOutputAudio(run) {
   run.audioRemovedByFfmpeg = true;
 }
 
-async function startWawImages(run, retryIndexes) {
+async function prepareWawProductImages(products, { opaque = false } = {}) {
+  return Promise.all(products.map(async (item, index) => {
+    let stdout;
+    try {
+      ({ stdout } = await execFileAsync(FFMPEG_PATH, [
+        "-v", "error", "-i", item.path, "-frames:v", "1",
+        "-filter_complex", "scale=800:800:force_original_aspect_ratio=decrease:flags=lanczos,pad=800:800:(ow-iw)/2:(oh-ih)/2:color=white,setsar=1" + (opaque ? ",format=rgba,split[fg][bg];[bg]lutrgb=r=255:g=255:b=255,format=rgb24[white];[white][fg]overlay=shortest=1:format=auto,format=rgb24" : ""),
+        "-f", "image2pipe", "-vcodec", "png", "pipe:1"
+      ], { encoding: "buffer", windowsHide: true, maxBuffer: 8 * 1024 * 1024, timeout: 30_000 }));
+    } catch (error) {
+      throw new Error(`第 ${index + 1} 张商品参考图预处理失败，请检查图片后重新上传`, { cause: error });
+    }
+    return { bytes: stdout, mime: "image/png", name: `product-reference-${index + 1}.png` };
+  }));
+}
+
+function recoverableKlingImage(task) {
+  return Boolean(task?.fallback?.taskId && !["FAILED", "CANCELED", "CANCELLED", "UNKNOWN"].includes(task.fallback.status));
+}
+
+async function klingImageFetch(path, options = {}) {
+  const key = (process.env.BAILIAN_IMAGE_API_KEY || process.env.BAILIAN_API_KEY || "").trim();
+  if (!key) throw new HttpError(409, "备用图片服务尚未配置");
+  const response = await fetch(BAILIAN_IMAGE_API_BASE + path, {
+    ...options, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json", ...options.headers }
+  });
+  const raw = await response.text();
+  let body;
+  try { body = JSON.parse(raw); } catch { body = { message: raw.slice(0, 1000) }; }
+  if (!response.ok || body.code || body.error) throw new HttpError(response.status >= 400 ? response.status : 502, body.message || body.error?.message || "备用图片服务请求失败", body);
+  return body;
+}
+
+async function fallbackKlingImage(run, task, frame) {
+  task.provider = "aliyun-bailian-kling";
+  task.fallback ||= { status: "PREPARING", taskId: null, model: BAILIAN_IMAGE_MODEL };
+  if (!task.fallback.taskId) {
+    if (!run.publicBaseUrl) {
+      run.imageTransport = { status: "WAITING", requestedAt: new Date().toISOString() };
+      await persistRun(run);
+      const deadline = Date.now() + 10 * 60_000;
+      while (!run.publicBaseUrl && run.imageTransport.status === "WAITING" && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      if (!run.publicBaseUrl) { task.status = "FAILED"; throw new Error("备用图片通道暂时无法连接，请重试"); }
+    }
+    if (run.fallbackProductImages?.length !== run.productImages.length) {
+      // Kling accepts public JPEG/PNG URLs, not the WebP uploads accepted by the primary.
+      const uploads = await prepareWawProductImages(run.productImages, { opaque: true });
+      const prepared = [];
+      for (const upload of uploads) {
+        const id = randomUUID();
+        const path = join(RUNS_DIR, run.id, "inputs", "product-image", `${id}.png`);
+        await writeFile(path, upload.bytes);
+        const item = { id, name: upload.name, mime: "image/png", size: upload.bytes.length, path, category: "inputs/product-image" };
+        prepared.push(item);
+      }
+      run.fallbackProductImages = prepared;
+      prepared.forEach(item => media.set(item.id, item));
+    }
+    const imageUrl = item => new URL(publicMedia(item).url, run.publicBaseUrl).toString();
+    const request = {
+      model: BAILIAN_IMAGE_MODEL,
+      input: { messages: [{ role: "user", content: [{ text: run.imagePrompt }, { image: imageUrl(frame) }, ...run.fallbackProductImages.map(item => ({ image: imageUrl(item) }))] }] },
+      parameters: { n: 1, result_type: "single", aspect_ratio: run.ratio || "9:16", resolution: BAILIAN_IMAGE_RESOLUTION, watermark: false }
+    };
+    task.status = "SUBMITTING";
+    task.fallback.status = "SUBMITTING";
+    await persistRun(run); // Never submit before the attempt is durably recorded.
+    let response;
+    try {
+      response = await klingImageFetch("/api/v1/services/aigc/image-generation/generation", { method: "POST", headers: { "X-DashScope-Async": "enable" }, body: JSON.stringify(request) });
+    } catch (error) {
+      task.fallback.error = error.message;
+      task.fallback.details = error.details;
+      task.status = error instanceof HttpError && error.status < 500 && error.status !== 408 ? "FAILED" : "UNCERTAIN";
+      task.fallback.status = task.status;
+      throw error;
+    }
+    task.fallback.taskId = taskId(response);
+    task.taskId = task.fallback.taskId;
+    task.fallback.lastResponse = response;
+    task.fallback.status = response.output?.task_status || "PENDING";
+    if (!task.fallback.taskId) { task.status = task.fallback.status = "UNCERTAIN"; throw new Error("备用图片服务未返回任务编号，请稍后重试"); }
+    task.status = "PROCESSING";
+    await persistRun(run);
+  }
+  const deadline = Date.now() + 12 * 60_000;
+  while (true) {
+    const response = await klingImageFetch(`/api/v1/tasks/${encodeURIComponent(task.fallback.taskId)}`);
+    task.fallback.lastResponse = response;
+    task.fallback.status = String(response.output?.task_status || "UNKNOWN").toUpperCase();
+    run.billing.kling = mergeUsage(run.billing.kling, response, "aliyun-bailian-kling", "CNY");
+    await persistRun(run);
+    if (["FAILED", "CANCELED", "CANCELLED", "UNKNOWN"].includes(task.fallback.status)) {
+      task.status = "FAILED";
+      throw new Error(response.output?.message || "备用图片生成失败，请重试");
+    }
+    if (normalized(task.fallback.status) === "succeeded") {
+      const url = bailianImageResult(response);
+      if (!url) throw new Error("备用图片结果暂不可用，请重试获取");
+      return { data: [{ url }], usage: response.usage };
+    }
+    if (Date.now() >= deadline) throw new Error("图片仍在生成，请稍后重试获取结果");
+    await new Promise(resolve => setTimeout(resolve, BAILIAN_IMAGE_POLL_MS));
+  }
+}
+
+async function startWawImages(run, retryIndexes, { recoverOnly = false } = {}) {
   if (imageWorkers.has(run.id)) throw new HttpError(409, "关键帧仍在生成，请等待完成");
   if (!process.env.WAW_API_KEY?.trim()) throw new HttpError(409, "图片生成服务尚未配置，请配置 WAW_API_KEY");
   const frames = run.videoMode === "multi_keyframes" ? run.keyframes || [] : [run.firstFrame];
-  const indexes = run.imageProvider === "wawapi" && run.status === "FAILED"
+  const indexes = recoverOnly ? frames.map((_, i) => i).filter(i => run.imageTasks?.[i]?.status !== "SUCCEEDED" && recoverableKlingImage(run.imageTasks?.[i])) : run.imageProvider === "wawapi" && run.status === "FAILED"
     ? frames.map((_, i) => i).filter(i => run.imageTasks?.[i]?.status !== "SUCCEEDED")
     : retryIndexes ?? frames.map((_, i) => i);
   if (!indexes.length || indexes.some(i => !Number.isInteger(i) || !frames[i])) throw new HttpError(400, "关键帧序号无效");
   run.imageTasks ||= [];
   run.editedKeyframes ||= [];
   for (const i of indexes) {
-    if (run.imageTasks[i]?.editedImage) {
+    if (run.imageTasks[i] && !recoverOnly && !recoverableKlingImage(run.imageTasks[i]) && !run.imageTasks[i].responsePath && !run.imageTasks[i].rawPath) {
+      run.imageHistory ||= [];
+      run.imageHistory.push(structuredClone(run.imageTasks[i]));
+    } else if (run.imageTasks[i]?.editedImage) {
       run.imageHistory ||= [];
       run.imageHistory.push(run.imageTasks[i]);
     }
     const previous = run.imageTasks[i];
-    run.imageTasks[i] = (previous?.responsePath || previous?.rawPath) && previous.status !== "SUCCEEDED"
+    run.imageTasks[i] = (previous?.responsePath || previous?.rawPath || recoverableKlingImage(previous)) && previous.status !== "SUCCEEDED"
       ? { ...previous, status: "QUEUED" }
       : { index: i, provider: "wawapi", status: "QUEUED", taskId: null, editedImage: null };
     run.editedKeyframes[i] = null;
@@ -634,14 +749,23 @@ async function startWawImages(run, retryIndexes) {
   imageWorkers.add(run.id);
   try { await persistRun(run); } catch (error) { imageWorkers.delete(run.id); throw error; }
   void (async () => {
+    let productUploads;
     for (const i of indexes) {
       const task = run.imageTasks[i];
       try {
         if (!task.responsePath && !task.rawPath) {
+        let body;
+        if (recoverableKlingImage(task)) {
+          body = await fallbackKlingImage(run, task, frames[i]);
+        } else {
         const form = new FormData();
-        for (const [n, item] of [frames[i], ...run.productImages].entries()) {
-          form.append("image", new Blob([await readFile(item.path)], { type: item.mime }), n === 0 ? "scene.png" : item.name);
+        // Keep the scene and original uploads intact; normalize only product references.
+        productUploads ||= await prepareWawProductImages(run.productImages);
+        form.append("image", new Blob([await readFile(frames[i].path)], { type: frames[i].mime }), "scene.png");
+        for (const item of productUploads) {
+          form.append("image", new Blob([item.bytes], { type: item.mime }), item.name);
         }
+        task.productImagePreprocessing = { width: 800, height: 800, fit: "contain", padding: "white", format: "png", sourceIds: run.productImages.map(item => item.id) };
         task.request = { model: WAW_IMAGE_MODEL, prompt: run.imagePrompt, size: "864x1536", quality: "medium", n: 1 };
         for (const [name, value] of Object.entries(task.request)) form.append(name, String(value));
         task.status = "SUBMITTING";
@@ -654,12 +778,18 @@ async function startWawImages(run, retryIndexes) {
         task.httpStatus = response.status;
         task.requestId = response.headers.get("x-request-id");
         const raw = await response.text();
-        let body;
         try { body = JSON.parse(raw); } catch { body = { error: { message: raw.slice(0, 1000) } }; }
         if (!response.ok) {
           task.status = response.status >= 500 || response.status === 408 ? "UNCERTAIN" : "FAILED";
           task.providerError = body.error || body;
-          throw new Error(response.status === 401 || response.status === 403 ? "图片服务密钥无效或无权限，请检查配置" : response.status === 402 ? "图片服务余额不足，请充值后重试" : response.status === 429 ? "图片服务繁忙，请稍后重试" : "图片服务连接异常，请重试");
+          if (response.status === 400) {
+            // A definite rejection, not a timeout: switch only this frame, without exposing a retry screen.
+            task.status = "PROCESSING";
+            await persistRun(run);
+            await logRun(run, "image_fallback_started", { index: i, from: "wawapi", to: "aliyun-bailian-kling", httpStatus: 400, requestId: task.requestId });
+            body = await fallbackKlingImage(run, task, frames[i]);
+          } else throw new Error(response.status === 401 || response.status === 403 ? "图片服务密钥无效或无权限，请检查配置" : response.status === 402 ? "图片服务余额不足，请充值后重试" : response.status === 429 ? "图片服务繁忙，请稍后重试" : "图片服务连接异常，请重试");
+        }
         }
         // Save the receipt before decoding/downloading: a failed archive must not trigger another paid edit.
         task.status = "RESPONSE_RECEIVED";
@@ -1008,6 +1138,10 @@ async function refreshRun(run, { force = false } = {}) {
   ensureRunMetrics(run);
   if (run.stage === "image" && run.imageProvider === "wawapi" && !MOCK) {
     if (!imageWorkers.has(run.id) && run.status === "PROCESSING") {
+      if ((run.imageTasks || []).some(task => task.status !== "SUCCEEDED" && recoverableKlingImage(task))) {
+        await startWawImages(run, null, { recoverOnly: true });
+        return; // Recover existing async IDs only; a GET must never submit a paid request.
+      }
       for (const task of run.imageTasks || []) if (task.status === "SUBMITTING") task.status = "UNCERTAIN";
       finishWawImages(run);
       await persistRun(run);
@@ -1464,6 +1598,19 @@ const server = http.createServer(async (req, res) => {
       await refreshRun(run);
       return sendJson(res, 200, publicRun(run));
     }
+    const imageTransportMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/image\/transport$/);
+    if (req.method === "POST" && imageTransportMatch) {
+      const run = runs.get(imageTransportMatch[1]);
+      if (!run) throw new HttpError(404, "Run 不存在");
+      const body = await readJson(req);
+      if (run.stage !== "image" || run.imageTransport?.status !== "WAITING") return sendJson(res, 200, publicRun(run));
+      const value = String(body.publicBaseUrl || "").trim();
+      if (value && !/^https?:\/\//i.test(value)) throw new HttpError(400, "临时素材地址无效");
+      run.publicBaseUrl = value || null;
+      run.imageTransport.status = value ? "READY" : "FAILED";
+      await persistRun(run);
+      return sendJson(res, 200, publicRun(run));
+    }
     const retryImageMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/image\/retry$/);
     if (req.method === "POST" && retryImageMatch) {
       const run = runs.get(retryImageMatch[1]);
@@ -1471,6 +1618,7 @@ const server = http.createServer(async (req, res) => {
       rejectUserStoppedRun(run);
       const body = await readJson(req);
       rejectUserStoppedRun(run);
+      if (Object.hasOwn(body, "publicBaseUrl")) run.publicBaseUrl = body.publicBaseUrl || null;
       const retryIndexes = [...new Set((Array.isArray(body.indexes) ? body.indexes : url.searchParams.has("index") ? [Number(url.searchParams.get("index"))] : []).map(Number))].sort((a, b) => a - b);
       if (body.continueOnly === true && run.imageProvider === "wawapi") {
         await refreshRun(run);

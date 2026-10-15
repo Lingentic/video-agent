@@ -537,7 +537,7 @@ async function createKlingRun({ videoPath, productPaths, productPath, voiceScrip
     return klingRequest("api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId, sourceVideoId: sourceVideo.id, productImageId: productImage.id, productSubject: selectedProductSubject, imagePrompt, videoPrompt, voiceScript: script, audioMode: audioMode === "silent" ? "silent" : "voice", videoMode: selectedVideoMode, publicBaseUrl, resolution: "720P", duration: selectedDuration }) });
   }
   const { runId } = await klingRequest("api/run-id", { method: "POST" });
-  const publicBaseUrl = null; // WawAPI edits uploads files directly.
+  const publicBaseUrl = null; // Prepare the URL-based backup only if an image is rejected with HTTP 400.
   const tempDir = path.join(app.getPath("temp"), "video-client-electron", "keyframes", runId);
   await mkdir(tempDir, { recursive: true });
   try {
@@ -592,7 +592,22 @@ async function stopKlingRun(runId, stage) {
 }
 
 async function retryKlingImage(runId, indexes, continueOnly = false) {
-  return klingRequest(`api/runs/${encodeURIComponent(runId)}/image/retry`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ indexes: Array.isArray(indexes) ? indexes : [], continueOnly }) });
+  const publicBaseUrl = null; // Each retry prepares a fresh URL only when the backup is actually needed.
+  return klingRequest(`api/runs/${encodeURIComponent(runId)}/image/retry`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ indexes: Array.isArray(indexes) ? indexes : [], continueOnly, publicBaseUrl }) });
+}
+
+const imageTransportWorkers = new Set();
+async function getKlingRun(runId) {
+  const run = await klingRequest(`api/runs/${encodeURIComponent(runId)}`);
+  if (run.imageTransport?.status === "WAITING" && !imageTransportWorkers.has(runId)) {
+    imageTransportWorkers.add(runId);
+    void (async () => {
+      let publicBaseUrl = null;
+      try { publicBaseUrl = await ensureQuickTunnel(getReadyKlingService()); } catch {}
+      await klingRequest(`api/runs/${encodeURIComponent(runId)}/image/transport`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ publicBaseUrl }) });
+    })().catch(() => {}).finally(() => imageTransportWorkers.delete(runId));
+  }
+  return run; // Tunnel setup never blocks progress polling or the primary image request.
 }
 
 async function listKlingAssets() {
@@ -1357,7 +1372,7 @@ handleClientIpc("kling-get-config", () => getKlingConfig());
 handleClientIpc("kling-list-assets", () => listKlingAssets());
 handleClientIpc("kling-get-latest-recoverable", () => getLatestRecoverableKlingRun());
 handleClientIpc("kling-create-run", (_event, payload) => createKlingRun(payload || {}));
-handleClientIpc("kling-get-run", (_event, runId) => klingRequest(`api/runs/${encodeURIComponent(runId)}`));
+handleClientIpc("kling-get-run", (_event, runId) => getKlingRun(runId));
 handleClientIpc("kling-start-video", (_event, runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit, voiceEnabled, voiceId) => startKlingVideo(runId, voiceScript, videoMode, duration, keyframeTimes, confirmResubmit, voiceEnabled, voiceId));
 handleClientIpc("kling-inspect-reference-audio", (_event, videoPath) => inspectReferenceAudio(videoPath));
 handleClientIpc("kling-resume-run", (_event, runId) => resumeKlingRun(runId));

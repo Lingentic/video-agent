@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
@@ -15,14 +15,45 @@ for (const productCount of [1, 3]) test(`WawAPI edit (${productCount} product re
   const source = path.join(dir, "source-scene.png");
   const bytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
   await writeFile(source, bytes);
+  const productSizes = productCount === 1 ? [[1440, 1440]] : [[1440, 720], [720, 1440], [800, 800]];
+  const products = [];
+  const originalProducts = [];
+  for (const [index, [width, height]] of productSizes.entries()) {
+    const productPath = path.join(dir, `product-${index + 1}.png`);
+    execFileSync(process.env.FFMPEG_PATH || "ffmpeg", ["-v", "error", "-f", "lavfi", "-i", `color=c=red:s=${width}x${height}`, "-frames:v", "1", productPath], { windowsHide: true });
+    const original = await readFile(productPath);
+    products.push({ id: `product${index + 1}`, name: `product-${index + 1}.png`, mime: "image/png", size: original.length, path: productPath });
+    originalProducts.push(original);
+  }
   let calls = 0, failAt = 2, received = [], gatewayAt = 0, badAt = 0;
   const provider = http.createServer(async (req, res) => {
     let chunks=[]; for await (const b of req) chunks.push(b);
-    const body=Buffer.concat(chunks).toString("utf8"); received.push(body); calls++;
+    const requestBytes=Buffer.concat(chunks);
+    const body=requestBytes.toString("utf8"); received.push(body); calls++;
     assert.equal(req.url, "/v1/images/edits");
     assert.match(req.headers["content-type"], /multipart\/form-data; boundary=/);
     assert.equal((body.match(/name="image"/g)||[]).length, 1 + productCount);
-    assert.deepEqual([...body.matchAll(/name="image"; filename="([^"]+)"/g)].map(match => match[1]), ["scene.png", ...Array.from({length:productCount}, (_, i) => productCount === 1 ? "frame.png" : `product-${i + 1}.png`)]);
+    assert.deepEqual([...body.matchAll(/name="image"; filename="([^"]+)"/g)].map(match => match[1]), ["scene.png", ...Array.from({length:productCount}, (_, i) => `product-reference-${i + 1}.png`)]);
+    const submitted = await new Response(requestBytes, {headers: {"content-type": req.headers["content-type"]}}).formData();
+    const images = submitted.getAll("image");
+    assert.deepEqual(Buffer.from(await images[0].arrayBuffer()), bytes, "scene must be sent unchanged");
+    for (const [index, image] of images.slice(1).entries()) {
+      const png = Buffer.from(await image.arrayBuffer());
+      assert.equal(image.type, "image/png");
+      assert.equal(png.readUInt32BE(16), 800);
+      assert.equal(png.readUInt32BE(20), 800);
+      if (calls === 1) {
+        const pixels = execFileSync(process.env.FFMPEG_PATH || "ffmpeg", ["-v", "error", "-i", "pipe:0", "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"], {input: png, windowsHide: true, maxBuffer: 4 * 1024 * 1024});
+        const pixel = (x, y) => [...pixels.subarray((y * 800 + x) * 3, (y * 800 + x) * 3 + 3)];
+        const [width, height] = productSizes[index];
+        if (width !== height) {
+          assert.deepEqual(pixel(0, 0), [255, 255, 255], "non-square products use white padding");
+          assert.deepEqual(pixel(width > height ? 400 : 199, width > height ? 199 : 400), [255, 255, 255]);
+        }
+        const center = pixel(400, 400);
+        assert.ok(center[0] > 240 && center[1] < 10 && center[2] < 10, "product stays centered without cropping");
+      }
+    }
     assert.match(body, /gpt-image-2/);
     assert.match(body, /medium/);
     await pause(40);
@@ -36,7 +67,6 @@ for (const productCount of [1, 3]) test(`WawAPI edit (${productCount} product re
     await new Promise(r=>provider.listen(0,"127.0.0.1",r));
     const runDir=path.join(dir,"test-run"); await mkdir(path.join(runDir,"kling-output"),{recursive:true});
     const frames=[0,1,2,3].map(i=>({id:"frame"+i,name:"frame.png",mime:"image/png",size:bytes.length,path:source}));
-    const products = productCount === 1 ? [frames[0]] : [1,2,3].map(i => ({...frames[0], id:`product${i}`, name:`product-${i}.png`}));
     await writeFile(path.join(runDir,"run.json"),JSON.stringify({id:"test-run",stage:"image",status:"FAILED",videoMode:"multi_keyframes",keyframes:frames,productImage:products[0],...(productCount === 3 ? {productImages:products} : {}),imagePrompt:"将第一张图片中人物手中的物品自然地替换成第二张的主体物品",imageTasks:[],editedKeyframes:[],createdAt:new Date().toISOString()}));
     const probe=http.createServer(); await new Promise(r=>probe.listen(0,"127.0.0.1",r)); const port=probe.address().port; await new Promise(r=>probe.close(r));
     client=spawn(process.execPath,[serverPath],{cwd:root,env:{...process.env,PORT:String(port),HOST:"127.0.0.1",RUNS_DIR:dir,MOCK_PIPELINE:"false",WAW_API_KEY:"test-only",WAW_API_BASE:"http://127.0.0.1:"+provider.address().port+"/v1"},stdio:"ignore",windowsHide:true});
@@ -91,6 +121,9 @@ for (const productCount of [1, 3]) test(`WawAPI edit (${productCount} product re
     assert.deepEqual(disk.productImages.map(item => item.id), products.map(item => item.id));
     assert.equal(disk.productImage.id, products[0].id);
     const png=await readFile(disk.editedKeyframes[0].path); assert.equal(png.readUInt32BE(16),864); assert.equal(png.readUInt32BE(20),1536);
+    assert.deepEqual(await readFile(source), bytes, "original source scene is not overwritten");
+    for (const [index, item] of products.entries()) assert.deepEqual(await readFile(item.path), originalProducts[index], "original product is not overwritten");
+    assert.deepEqual(disk.imageTasks[0].productImagePreprocessing, {width: 800, height: 800, fit: "contain", padding: "white", format: "png", sourceIds: products.map(item => item.id)});
     assert.equal(JSON.stringify(disk).includes("test-only"),false);
     console.log("isolated results:",dir);
   } finally { client?.kill(); provider.closeAllConnections(); await new Promise(r=>provider.close(r)); }
