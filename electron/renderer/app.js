@@ -74,26 +74,254 @@ let voicePreviewAudio = null;
 const esc = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
 const mediaUrl = (file) => file ? URL.createObjectURL(file) : "";
 const cleanRemoteError = (error) => String(error?.message || error || "未知错误").replace(/^Error invoking remote method '[^']+':\s*Error:\s*/i, "").trim();
-function friendlyRemakeError(error, stage = "video") {
+function friendlyImageError(error, failure = null) {
   const message = cleanRemoteError(error);
-  if (stage === "image" && /是否生成暂时无法确认/.test(message)) return "连接中断，部分图片是否生成暂时无法确认。已完成图片已保留；重新生成可能重复计费，请先核对记录。";
+  let reason = failure?.reason || "unknown";
+  if (!failure?.reason) {
+    if (/ENOSPC|No space left|空间不足/i.test(message)) reason = "disk";
+    else if (/EACCES|EPERM|Permission denied|Access is denied/i.test(message)) reason = "permission";
+    else if (/ENOENT|原始关键帧不存在|no such file/i.test(message)) reason = "missing_input";
+    else if (/结果图片下载|结果暂不可用/i.test(message)) reason = "download";
+    else if (/返回.*图片.*无效|未返回有效图片|Invalid data|ffmpeg|Command failed/i.test(message)) reason = "invalid_result";
+    else if (/未配置|密钥|凭证|无权限|HTTP\s*(?:401|403)|InvalidApiKey|unauthorized|authentication/i.test(message)) reason = "auth";
+    else if (/余额|HTTP\s*402|insufficient.*(?:balance|credit|quota)|Arrearage/i.test(message)) reason = "balance";
+    else if (/No available compatible accounts|429|请求过多|限流|繁忙|too many requests|rate.?limit/i.test(message)) reason = "busy";
+    else if (/审核|版权|违禁|content.?policy|moderation|safety/i.test(message) && !/may be|might|可能|unknown issue/i.test(message)) reason = "review";
+    else if (/HTTP\s*(?:400|422)|invalid.?param|validation/i.test(message)) reason = "rejected";
+    else if (/图片仍在生成|关键帧仍在生成/i.test(message)) reason = "processing";
+    else if (/通道/i.test(message)) reason = "tunnel";
+    else if (/HTTP\s*5\d\d/i.test(message)) reason = "service";
+    else if (/fetch failed|无法连接|ECONN|ENOTFOUND|TLS|连接.*(?:中断|异常|不稳定)|网络|超时|timeout|timed out/i.test(message)) reason = "network";
+  }
+  const messages = {
+    auth: "图片生成功能暂时用不了，请联系工作人员检查服务设置后再点“重试”。",
+    balance: "图片生成服务余额不足，请联系工作人员充值后再点“重试”。",
+    busy: "图片生成服务现在较忙，请等一会儿再点“重试”。",
+    review: "素材没有通过内容检查，请重新选择商品图或参考视频后再生成。",
+    rejected: "图片服务没有接受这次请求。请先点“重试”；仍失败时，请导出诊断日志发给工作人员。",
+    network: "图片生成时连接中断或等待太久，请检查网络后点“重试”。",
+    tunnel: "图片传送通道没连上，请检查网络后点“重试”。",
+    service: "图片生成服务出了问题，请等一会儿再点“重试”。",
+    download: "生成的图片没能下载到电脑，请检查网络后点“重试”。",
+    invalid_result: "返回的图片无法打开，请点“重试”；仍失败时，请导出诊断日志发给工作人员。",
+    missing_input: "找不到生成时用的原图，请重新选择商品图和参考视频后再生成。",
+    disk: "电脑空间不够，图片没能保存。请清理一些空间后点“重试”。",
+    permission: "图片没能保存到电脑，请关闭占用文件的程序后点“重试”；仍失败时，请导出诊断日志。",
+    processing: "图片还在生成，请等一会儿再点“重试”，继续获取结果。",
+    unknown: "关键帧没能生成，暂时还不知道原因。请点“重试”；仍失败时，请导出诊断日志发给工作人员。"
+  };
+  return messages[reason] || messages.unknown;
+}
+
+function friendlyOperationError(error, operation) {
+  const message = cleanRemoteError(error);
+  const network = /fetch failed|ECONN|ENOTFOUND|TLS|network|网络|超时|timeout|timed out/i.test(message);
+  const missing = /ENOENT|No such file|不存在|丢失|已移动|缺少|没有.*样本|未找到/i.test(message);
+  if (operation === "preview") return network ? "试听声音没能加载，请检查网络后再点播放。" : "这个音色暂时无法试听，请选择其他音色；需要使用它时，请重新上传声音。";
+  if (operation === "revoice") {
+    if (/余额|\b402\b|insufficient.*(?:balance|credit|quota)/i.test(message)) return "配音服务余额不足，请联系工作人员处理后再试。原视频已保留。";
+    if (/密钥|凭证|未配置|无权限|\b40[13]\b|unauthorized|authentication/i.test(message)) return "配音服务暂时用不了，请联系工作人员处理。原视频已保留。";
+    if (network) return "配音时连接中断，请检查网络后点“更换声音并重新配音”再试。原视频已保留。";
+    if (missing || /音频|声音|codec|format|sample.?rate/i.test(message)) return "所选声音暂时无法用于配音，请点“更换声音并重新配音”选择其他音色。原视频已保留。";
+    return "这次配音没能完成，请点“更换声音并重新配音”再试。原视频已保留。";
+  }
+  if (operation === "stop-images") return "这次没能结束任务，请稍后再点“保留图片并结束”。不要关闭客户端。";
+  if (operation === "stop") return "这次没能中止任务，请稍后再点“中止任务”。不要关闭客户端。";
+  if (operation === "export") {
+    if (/ENOSPC|No space left|空间不足/i.test(message)) return "保存位置空间不够，请清理空间或选择其他位置，再点“导出”。";
+    if (/EACCES|EPERM|Permission denied|Access is denied|权限/i.test(message)) return "不能保存到这个位置，请重新点“导出”，选择桌面等可保存的位置。";
+    if (missing) return "找不到要导出的结果，请确认没有移动或删除文件，再进入素材库导出。";
+    return "这次导出没能完成，请检查保存位置后再点“导出”。仍失败时，请导出诊断日志。";
+  }
+  if (operation === "library") return "素材库暂时没能打开，请稍后重新进入素材库。仍失败时，请导出诊断日志。";
+  return "运行目录没能打开，请稍后再点“运行目录”。仍失败时，请导出诊断日志。";
+}
+
+function friendlyRemakeError(error, stage = "video", recovery = null) {
+  const message = cleanRemoteError(error);
+  if (stage === "image") return friendlyImageError(error, error?.imageFailure);
+  if (recovery?.kind === "voice") {
+    if (recovery.reason === "size") {
+      const maxBytes = Number(recovery.maxBytes) > 0 ? Number(recovery.maxBytes) : 20_000_000;
+      return `声音文件超过 ${maxBytes / 1_000_000} MB（${maxBytes.toLocaleString("en-US")} 字节），请重新上传或选择其他音色。`;
+    }
+    if (recovery.reason === "duration") return "声音长度不符合生成要求，请重新上传 8–15 秒音频或选择其他音色。";
+    if (recovery.reason === "missing") return "找不到所选音色的声音文件，请重新上传声音或选择其他音色。";
+    return "这段声音无法使用，请重新上传 MP3、WAV、M4A 音频或选择其他音色。";
+  }
+  if (recovery?.kind === "keyframes") {
+    const indexes = recovery.indexes || [];
+    return `${indexes.length ? `关键帧 ${indexes.map(index => index + 1).join("、")}` : "部分关键帧"}${recovery.reason === "size" ? "超过 10 MB" : recovery.reason === "missing" ? "缺失" : "无法读取或已损坏"}，请查看并重新生成或上传替代图片。`;
+  }
+  if (stage === "video") {
+    // FFmpeg prints normal Duration/FPS metadata even when the actual failure is a disk or file error.
+    if (/^Command failed:|ffmpeg (?:version|stderr)/i.test(message)) {
+      if (/ENOSPC|No space left|磁盘.*空间/i.test(message)) return "电脑空间不够，视频没能保存。请清理一些空间后再试。";
+      if (/Permission denied|EACCES|Access is denied/i.test(message)) return "没有权限把视频保存到这个文件夹，请联系工作人员处理。";
+      if (/ENOENT|No such file/i.test(message)) return "找不到生成时用的文件，请确认没有移动或删除素材。";
+      return "视频已经生成，但没能保存好。请导出诊断日志，发给工作人员。";
+    }
+    if (message.startsWith("视频服务报告多项问题：")) {
+      const reasons = message.slice("视频服务报告多项问题：".length).split(/(?<=。)\s+/).filter(Boolean).slice(0, 2);
+      return reasons.map(reason => friendlyRemakeError(reason, "video")).join(" ");
+    }
+    const frameRateError = /帧率|(?:\bfps\b|frame[_\s-]?rate)[^\n]{0,120}(?:must|should|required|missing|invalid|unsupported|not (?:set|supported|valid)|limit|out of)|(?:required|missing|invalid|unsupported)[^\n]{0,60}(?:\bfps\b|frame[_\s-]?rate)/i.test(message);
+    if (/余额不足|HTTP\s*402|insufficient[_\s-]*(?:balance|quota|credit)|arrearage/i.test(message)) return "生成服务余额不足，请联系工作人员充值。";
+    if (/权限|凭证|密钥|HTTP\s*(?:401|403)|unauthorized|authentication/i.test(message)) return "暂时无法使用视频生成服务，请联系工作人员处理。";
+    if (/\b429\b/i.test(message) || (/限频|请求较多|请求过多|请求过于频繁|rate[_\s-]*limit|too many requests/i.test(message) && !frameRateError)) return "现在生成视频的人较多，请稍后再试。";
+    if (/审核|内容检查|内容.*(?:拦截|违规)|content[_\s-]*(?:policy|moderation|filter)|safety|copyright/i.test(message)) return "图片或台词没有通过审核，请换张图片或修改台词后再试。";
+    if (frameRateError) return "视频的播放设置不合要求，请联系工作人员处理。";
+    if (/参考声音自动上传失败/i.test(message)) return "声音上传失败，已自动重试。请检查网络后点击下方按钮继续。";
+    if (/参考声音自动处理失败/i.test(message)) return "声音自动处理失败，请导出诊断日志，发给工作人员。";
+    if (/参考(?:音频|声音).*过大|(?:audio|声音|音频).*?(?:too large|size.*limit)/i.test(message)) return "声音文件超过 20 MB（20,000,000 字节），请重新上传或选择其他音色。";
+    if (/采样率|采样频率|sampl(?:e|ing)[_\s-]?(?:rate|frequency)[^;\n]{0,80}(?:invalid|unsupported|required|must|should|not supported)|(?:invalid|unsupported|missing)[^;\n]{0,60}sampl(?:e|ing)[_\s-]?(?:rate|frequency)/i.test(message)) return "声音已自动处理，但生成服务仍不支持。请重新上传声音或选择其他音色。";
+    if (/(?:audio|音频|声音)[^;\n]*(?:URL|地址)|(?:URL|地址)[^;\n]*(?:audio|音频|声音)/i.test(message)) return "声音已上传，但生成服务没能读取。请点击下方按钮继续。";
+    if (/(?:audio|音频|声音)[^;\n]*(?:duration|length|时长)|(?:duration|length|时长)[^;\n]*(?:audio|音频|声音)/i.test(message)) return "声音长度不符合生成要求，请重新上传 8–15 秒音频或选择其他音色。";
+    if (/关键帧或声音格式/i.test(message)) return "有图片或声音无法使用，请导出诊断日志，发给工作人员。";
+    if (/商品参考图|产品参考图/.test(message)) return "商品参考图无法使用，请回到素材阶段重新选择商品参考图。";
+    if (/图片.*压缩|关键帧过大/i.test(message)) return "关键帧图片压缩失败，请查看关键帧并重新生成或上传替代图片。";
+    if (/(?:audio|音频|声音)[^;\n]*(?:format|codec|格式|无效|不可用|invalid|unsupported)|(?:format|codec|格式|invalid|unsupported)[^;\n]*(?:audio|音频|声音)/i.test(message)) return "声音已自动处理，但生成服务仍不支持。请重新上传声音或选择其他音色。";
+    if (/(?:image|图片|关键帧)[^;\n]*(?:invalid|unsupported|format|decode|格式|无效|损坏)|(?:invalid|unsupported|format|decode|格式|无效|损坏)[^;\n]*(?:image|图片|关键帧)/i.test(message)) return "有关键帧图片无法使用，请查看并重新生成或上传替代图片。";
+    if (/缺少参考声音|没有可用.*声音|声音缺少|参考样本|所选声音不存在|参考声音文件无法读取/i.test(message)) return "找不到所选音色的声音文件，请重新上传声音或选择其他音色。";
+    if (/素材.*上传|上传.*(?:暂时失败|失败|中断)|素材通道/i.test(message)) return "图片或声音没能上传成功，请检查网络后再试。";
+    if (/分辨率|图片尺寸|宽高比|resolution|aspect[_\s-]?ratio/i.test(message)) return "图片大小不符合要求，请联系工作人员处理。";
+    if (/输出时长|duration/i.test(message)) return "视频长度不符合要求，请联系工作人员处理。";
+    if (/关键帧尚未|确认全部替换关键帧|无法读取.*关键帧/i.test(message)) return "有图片还没生成好，或已经找不到了。请先查看关键帧。";
+    if (/ENOENT|EACCES|本地素材|文件.*(?:不存在|无法读取)/i.test(message)) return "找不到生成时用的文件，请确认没有移动或删除素材。";
+    if (/视频已生成.*下载|下载.*(?:失败|无效)/i.test(message)) return "视频已经做好，但没能下载到电脑。请稍后继续，不用重新生成。";
+    if (/任务仍在处理|已有视频任务/i.test(message)) return "视频还在生成，请点击“继续当前任务”继续等待。";
+    if (/未配置|尚未配置/i.test(message)) return "视频生成功能还没设置好，请联系工作人员处理。";
+    if (/没有返回任务编号|提交结果暂时无法确认|上次视频提交结果不确定/i.test(message)) return "还没收到上次生成的结果，做好的图片已经保存。";
+    if (/fetch failed|无法连接|ECONN|ENOTFOUND|TLS|连接.*(?:中断|不稳定)|请求超时|timeout|timed out|等待.*超时/i.test(message)) return "连接中断或等待太久，请检查网络后点击下方按钮继续。";
+    if (/内部处理失败/i.test(message)) return "视频生成服务出了问题，请稍后再试。";
+    if (/未接受|invalid[_\s-]*(?:parameter|argument)|validation|参数/i.test(message)) return "这次的素材或视频设置无法使用，请导出诊断日志，发给工作人员。";
+    return "这次没能生成视频，暂时还查不出原因。请导出诊断日志，发给工作人员。";
+  }
   if (/余额不足|HTTP\s*402|\b402\b/i.test(message)) return "当前服务余额不足，请充值后再试。";
   if (/429|限频|频率|请求过多/i.test(message)) return "当前使用人数较多，请稍后再试。";
   if (/风控|版权|内容.*拦截|审核/i.test(message)) return "素材或台词未通过服务检查，请调整后再试。";
   if (/fetch failed|无法连接|ECONN|ENOTFOUND|TLS|网络通道|请求超时|启动超时|timeout/i.test(message)) return "网络连接暂时不稳定，服务未能响应，请稍后再试。";
-  if (stage === "image") return "部分关键帧未能生成，请稍后重试对应图片。";
   if (stage === "voice") return "配音暂时未能生成，视频结果已经保留。";
   return "视频暂时未能生成，当前进度已经保留。";
 }
-function friendlyVoiceCreateError(error) {
+function remakeRecovery(error, recovery = null) {
+  if (recovery?.kind === "voice" || recovery?.kind === "keyframes") return recovery;
   const message = cleanRemoteError(error);
-  if (/8[–-]15|8 秒|15 秒|时长/i.test(message)) return "参考音频需要在 8–15 秒之间，请重新选择。";
-  if (/音轨|音频|格式|读取|codec|Invalid data/i.test(message)) return "这段音频无法使用，请换一段 MP3、WAV 或 M4A 音频。";
-  if (/fetch failed|网络|timeout|超时|ECONN|ENOTFOUND|TLS/i.test(message)) return "网络暂时不稳定，请稍后再试。";
-  return "音色暂时未能创建，请稍后再试。";
+  if (/商品参考图|产品参考图/.test(message)) return null;
+  if (/(?:image|图片|关键帧)[^;\n]*(?:invalid|unsupported|format|decode|格式|无效|损坏|缺|过大|压缩)|(?:invalid|unsupported|decode)[^;\n]*(?:image|图片|关键帧)/i.test(message)) return { kind: "keyframes", reason: /过大|too large/i.test(message) ? "size" : /缺|找不到|missing/i.test(message) ? "missing" : "invalid", indexes: [] };
+  if (/声音|音频|audio|sample[_\s-]?rate/i.test(message)) {
+    if (/过大|too large|size.*limit/i.test(message)) return { kind: "voice", reason: "size" };
+    if (/时长|长度|duration|length/i.test(message)) return { kind: "voice", reason: "duration" };
+    if (/缺少|不存在|无法读取|参考样本|missing/i.test(message)) return { kind: "voice", reason: "missing" };
+    if (/格式|采样|format|codec|unsupported|处理失败/i.test(message)) return { kind: "voice", reason: "format" };
+  }
+  if (/关键帧|image.*(?:invalid|format|decode)|invalid image/i.test(message) && /缺|读取|损坏|过大|压缩|格式|invalid|decode|format/i.test(message)) return { kind: "keyframes", reason: /过大|too large/i.test(message) ? "size" : /缺|找不到|missing/i.test(message) ? "missing" : "invalid", indexes: [] };
+  return null;
 }
 
-function notify(message) { toast.textContent = message; toast.classList.add("show"); clearTimeout(notify.timer); notify.timer = setTimeout(() => toast.classList.remove("show"), 1800); }
+function canRepairRemake(item) {
+  return !item.running && !item.stopping && !item.videoTaskSubmitted && !["uncertain", "submitting", "accepted"].includes(item.videoSubmissionStatus);
+}
+
+function remakeKeyframeProblems(item) {
+  const count = Math.max(item.editedKeyframes.length, item.keyframeTimes.length, ...(item.keyframeProblems || []).map(index => index + 1));
+  return [...new Set([...(item.keyframeProblems || []), ...Array.from({ length: count }, (_, index) => index).filter(index => !item.editedKeyframes[index]?.url)])];
+}
+
+function applyRemakeRecovery(item, run, error) {
+  if (run) {
+    item.videoTaskSubmitted = Boolean(run.videoTaskId);
+    item.videoConfirmedFailed = Boolean(run.videoTaskId && String(run.videoStatus || "").toUpperCase() === "FAILED");
+    item.videoSubmissionStatus = run.videoSubmission?.status || "";
+    if (Array.isArray(run.editedKeyframes)) item.editedKeyframes = run.editedKeyframes;
+    if (Array.isArray(run.keyframeTimes)) item.keyframeTimes = run.keyframeTimes;
+    item.serviceBaseUrl = run.baseUrl || item.serviceBaseUrl;
+  }
+  const recovery = remakeRecovery(error, run?.recovery || error?.recovery);
+  if (recovery?.kind === "keyframes") {
+    item.keyframeProblems = recovery.indexes?.length ? recovery.indexes : Array.from({ length: Math.max(item.editedKeyframes.length, item.keyframeTimes.length) }, (_, index) => index);
+  }
+  if (recovery?.kind === "voice") item.useSavedVoice = false;
+  return recovery;
+}
+
+function reviewRemakeKeyframes(item) {
+  if (!canRepairRemake(item)) return;
+  item.videoRetryConfirm = false;
+  item.error = null;
+  item.imageReady = true;
+  item.selectedRetryIndexes = remakeKeyframeProblems(item);
+  const count = Math.max(item.editedKeyframes.length, item.keyframeTimes.length, ...item.selectedRetryIndexes.map(index => index + 1));
+  item.editedKeyframes = Array.from({ length: count }, (_, index) => item.editedKeyframes[index] || null);
+  item.stage = "替换关键帧已生成";
+  render();
+}
+
+function completeRemakeVoiceRecovery(item) {
+  if (!item.voiceRecoveryPending) return false;
+  const selectedVoice = item.voices.find(voice => voice.id === item.selectedVoiceId);
+  if (!selectedVoice || selectedVoice.demo) return false;
+  item.voiceRecoveryPending = false;
+  item.useSavedVoice = false;
+  item.voicePanel = null;
+  reviewRemakeKeyframes(item);
+  notify("声音已更新，请确认关键帧后继续生成视频");
+  return true;
+}
+
+async function replaceRemakeKeyframe(index, file) {
+  const item = state.remake;
+  if (!item.runId || !canRepairRemake(item) || !Number.isInteger(index)) return;
+  if (file.size >= 10_000_000) { notify("替代图片须小于 10 MB（10,000,000 字节），请重新选择"); return; }
+  if (!/\.(jpe?g|png|webp)$/i.test(file.name)) { notify("请选择 JPG、PNG 或 WEBP 图片"); return; }
+  item.running = true;
+  render();
+  try {
+    const run = await videoClient.replaceKlingKeyframe(item.runId, index, file);
+    assertCurrentRemake(item);
+    item.editedKeyframes = run.editedKeyframes || item.editedKeyframes;
+    item.keyframeProblems = (item.keyframeProblems || []).filter(value => value !== index);
+    item.selectedRetryIndexes = (item.selectedRetryIndexes || []).filter(value => value !== index);
+    item.imageReady = true;
+    notify(`关键帧 ${index + 1} 已替换，请确认后继续`);
+  } catch (error) { if (isCurrentRemake(item)) notify(friendlyRemakeError(error, "video")); }
+  finally { if (isCurrentRemake(item)) { item.running = false; render(); } }
+}
+
+async function prepareRemakeRecovery() {
+  const item = state.remake;
+  if (!item.runId || item.running || item.stopping || !item.videoTaskSubmitted || !item.videoConfirmedFailed || !item.error?.recovery || ["uncertain", "submitting"].includes(item.videoSubmissionStatus)) return;
+  item.running = true;
+  render();
+  try {
+    const run = await videoClient.prepareKlingRecovery(item.runId);
+    assertCurrentRemake(item);
+    item.runId = run.id;
+    const recovery = applyRemakeRecovery(item, run, run.message);
+    item.error = { stage: "video", rawStage: "video", recovery, message: friendlyRemakeError(run.message, "video", recovery), technicalMessage: run.message || "", videoRetryAvailable: true };
+    item.imageReady = false;
+  } catch (error) { if (isCurrentRemake(item)) notify(friendlyRemakeError(error, "video")); }
+  finally { if (isCurrentRemake(item)) { item.running = false; render(); } }
+}
+
+function friendlyVoiceCreateError(error) {
+  const message = cleanRemoteError(error);
+  if (/20,?000,?000|20\s*MB|过大|超.*(?:大小|上限)|too large/i.test(message)) return "参考音频超过 20 MB（20,000,000 字节），请重新选择较小的文件。";
+  if (/8[–-]15|8 秒|15 秒|时长/i.test(message)) return "参考音频需要在 8–15 秒之间，请重新选择。";
+  if (/余额|\b402\b|insufficient.*(?:balance|credit|quota)/i.test(message)) return "声音服务余额不足，请联系工作人员处理后，再点“创建并生成试听”。";
+  if (/密钥|凭证|未配置|无权限|\b40[13]\b|unauthorized|authentication/i.test(message)) return "声音服务暂时用不了，请联系工作人员处理后，再点“创建并生成试听”。";
+  if (/fetch failed|网络|timeout|超时|ECONN|ENOTFOUND|TLS|下载失败/i.test(message)) return "声音没能加载，请检查网络后再点“创建并生成试听”。";
+  if (/音轨|音频|格式|读取|codec|Invalid data/i.test(message)) return "这段音频无法使用，请换一段 MP3、WAV 或 M4A 音频。";
+  return "音色没能创建，请稍后再点“创建并生成试听”。仍失败时，请导出诊断日志。";
+}
+
+function validateVoiceSourceFile(file) {
+  if (file.size > 20_000_000) return "参考音频超过 20 MB（20,000,000 字节），请重新选择较小的文件。";
+  if (!/\.(mp3|wav|m4a)$/i.test(file.name)) return "请选择 MP3、WAV 或 M4A 音频。";
+  return "";
+}
+
+function notify(message) { toast.textContent = message; toast.classList.add("show"); clearTimeout(notify.timer); notify.timer = setTimeout(() => toast.classList.remove("show"), Math.min(10000, Math.max(1800, String(message).length * 120))); }
 function syncVoicePlaybackUi() {
   document.querySelectorAll('[data-action="voice-preview-play"]').forEach((button) => {
     const playing = button.dataset.voiceId === state.remake.voicePlayingId;
@@ -580,7 +808,7 @@ async function stopRemake() {
     item.stopping = false;
     item.stopConfirm = null;
     if (state.active === "remake") render();
-    notify(`中止失败：${cleanRemoteError(error)}`);
+    notify(friendlyOperationError(error, confirmation.stage === "image" ? "stop-images" : "stop"));
   } finally { item.stopRequest = null; }
 }
 function renderRemakeStopDialog(item) {
@@ -618,6 +846,7 @@ async function pollKlingRun(item = state.remake) {
     const status = String(response.status || "").toUpperCase();
     if (status === "FAILED") {
       const error = new Error(response.message || "产品替换失败");
+      error.imageFailure = response.imageFailure;
       error.stage = response.stage || "video";
       error.keyframeIndex = response.imageTasks?.find((task) => ["FAILED", "UNCERTAIN", "ARCHIVE_FAILED", "QUEUED"].includes(String(task.status || "").toUpperCase()))?.index;
       error.confirmedFailed = true;
@@ -650,7 +879,7 @@ async function completeRemakeResult(response, item = state.remake) {
       assertCurrentRemake(item);
     } catch (error) {
       if (!isCurrentRemake(item)) throw new RemakeStoppedError("任务已结束");
-      item.revoiceError = error.message;
+      item.revoiceError = friendlyOperationError(error, "revoice");
       result.voiceName = "原视频声音（克隆配音失败）";
     }
   }
@@ -683,8 +912,8 @@ async function revoiceCurrentResult() {
     notify("新声音已生成并替换到成片中");
   } catch (error) {
     if (!isCurrentRemake(item)) return;
-    item.revoiceError = error.message;
-    notify(`重新配音失败：${error.message}`);
+    item.revoiceError = friendlyOperationError(error, "revoice");
+    notify(item.revoiceError);
   } finally {
     if (!isCurrentRemake(item)) return;
     item.running = false;
@@ -717,6 +946,10 @@ async function runRemake({ retryVideo = false } = {}) {
     } else {
       item.runId = null;
       item.useSavedVoice = false;
+      item.keyframeProblems = [];
+      item.videoSubmissionStatus = "";
+      item.videoConfirmedFailed = false;
+      item.voiceRecoveryPending = false;
       updateRemakeStage("upload");
       render();
       response = await videoClient.createKlingRun(item.reference.file, item.products.map(product => product.file), item.voiceEnabled && !referenceVideoMode ? item.voiceScript : "", outputAudioEnabled ? "voice" : "silent", item.videoMode, item.duration, item.selectedVoiceId, item.productSubject);
@@ -751,7 +984,11 @@ async function runRemake({ retryVideo = false } = {}) {
     const technicalMessage = cleanRemoteError(error);
     const rawStage = error.stage || item.stage || "产品替换";
     const tunnelFailure = technicalMessage.includes("网络通道暂时未连接成功");
-    item.error = { stage: tunnelFailure ? "准备网络连接" : rawStage, rawStage, message: friendlyRemakeError(technicalMessage, rawStage), technicalMessage, keyframeIndex: error.keyframeIndex, confirmedFailed: Boolean(error.confirmedFailed), tunnelFailure };
+    let savedRun = null;
+    if (item.runId) try { savedRun = await videoClient.getKlingRun(item.runId); } catch {}
+    if (!isCurrentRemake(item)) return;
+    const recovery = applyRemakeRecovery(item, savedRun, error);
+    item.error = { stage: tunnelFailure ? "准备网络连接" : rawStage, rawStage, recovery, imageFailure: savedRun?.imageFailure || error.imageFailure, message: friendlyRemakeError(error, rawStage, recovery), technicalMessage, keyframeIndex: error.keyframeIndex, confirmedFailed: Boolean(error.confirmedFailed), tunnelFailure, videoRetryAvailable: rawStage === "video" && !savedRun?.videoTaskId && item.editedKeyframes.length > 0, submissionUncertain: ["submitting", "uncertain"].includes(savedRun?.videoSubmission?.status) };
   } finally {
     if (!isCurrentRemake(item)) return;
     item.stopConfirm = null;
@@ -778,6 +1015,7 @@ async function recoverRemake() {
     item.serviceBaseUrl = response.baseUrl || item.serviceBaseUrl;
     if (String(response.status || "").toUpperCase() === "FAILED") {
       const error = new Error(response.message || "原任务已确认失败");
+      error.imageFailure = response.imageFailure;
       error.stage = response.stage || "video";
       error.keyframeIndex = response.imageTasks?.find((task) => ["FAILED", "UNCERTAIN", "ARCHIVE_FAILED", "QUEUED"].includes(String(task.status || "").toUpperCase()))?.index;
       error.confirmedFailed = true;
@@ -802,11 +1040,14 @@ async function recoverRemake() {
     let savedRun = null;
     try { savedRun = await videoClient.getKlingRun(item.runId); } catch {}
     if (!isCurrentRemake(item)) return;
+    const recovery = applyRemakeRecovery(item, savedRun, error);
     const videoRetryAvailable = (rawStage === "video" || savedRun?.stage === "video") && !savedRun?.videoTaskId && item.editedKeyframes.length > 0;
     item.error = {
       stage: rawStage,
       rawStage,
-      message: friendlyRemakeError(error, rawStage),
+      recovery,
+      imageFailure: savedRun?.imageFailure || error.imageFailure,
+      message: friendlyRemakeError(error, rawStage, recovery),
       technicalMessage: cleanRemoteError(error),
       keyframeIndex: error.keyframeIndex,
       confirmedFailed: Boolean(error.confirmedFailed),
@@ -827,7 +1068,7 @@ async function confirmRemakeImage() {
   const item = state.remake;
   const selectedVoice = item.voices.find((voice) => voice.id === item.selectedVoiceId);
   const voiceSettingsValid = !item.voiceEnabled || (Boolean(item.voiceScript.trim()) && item.voiceScript.length <= item.duration * 6 && (item.useSavedVoice || (Boolean(selectedVoice) && selectedVoice.demo !== true)));
-  if (!item.runId || !item.imageReady || !item.editedKeyframes.length || item.running || item.stopping || !voiceSettingsValid) return;
+  if (!item.runId || !item.imageReady || !item.editedKeyframes.length || !canRepairRemake(item) || remakeKeyframeProblems(item).length || !voiceSettingsValid) return;
   item.running = true;
   item.videoTaskSubmitted = false;
   item.stopConfirm = null;
@@ -853,13 +1094,14 @@ async function confirmRemakeImage() {
     if (!isCurrentRemake(item)) return;
     const technicalMessage = cleanRemoteError(error);
     const videoRetryAvailable = !savedRun?.videoTaskId && item.editedKeyframes.length > 0;
-    item.error = { stage: "video", rawStage: "video", message: friendlyRemakeError(technicalMessage, "video"), technicalMessage, videoRetryAvailable, submissionUncertain: ["submitting", "uncertain"].includes(savedRun?.videoSubmission?.status), preservedKeyframeCount: item.editedKeyframes.length };
+    const recovery = applyRemakeRecovery(item, savedRun, error);
+    item.error = { stage: "video", rawStage: "video", recovery, message: friendlyRemakeError(technicalMessage, "video", recovery), technicalMessage, videoRetryAvailable, confirmedFailed: Boolean(savedRun?.videoTaskId && String(savedRun.status || "").toUpperCase() === "FAILED"), submissionUncertain: ["submitting", "uncertain"].includes(savedRun?.videoSubmission?.status), preservedKeyframeCount: item.editedKeyframes.length };
   } finally { if (isCurrentRemake(item)) { item.stopConfirm = null; item.running = false; item.progress = 0; if (state.active === "remake") render(); } }
 }
 
 async function retrySavedRemakeVideo() {
   const item = state.remake;
-  if (!item.runId || item.running || item.stopping || !item.editedKeyframes.length) return;
+  if (!item.runId || item.running || item.stopping || !item.editedKeyframes.length || (!item.videoTaskSubmitted && (remakeKeyframeProblems(item).length || item.error?.recovery))) return;
   item.videoRetryConfirm = false;
   item.running = true;
   item.videoTaskSubmitted = false;
@@ -879,17 +1121,19 @@ async function retrySavedRemakeVideo() {
     updateRemakeStage("completed");
     await completeRemakeResult(response, item);
     assertCurrentRemake(item);
-    notify("视频生成已完成，四张关键帧没有重复计费");
+    notify("视频生成已完成，已保留原来的关键帧");
   } catch (error) {
     if (!isCurrentRemake(item)) return;
     let savedRun = null;
     try { savedRun = await videoClient.getKlingRun(item.runId); } catch {}
     if (!isCurrentRemake(item)) return;
     const technicalMessage = cleanRemoteError(error);
+    const recovery = applyRemakeRecovery(item, savedRun, error);
     item.error = {
       stage: "video",
       rawStage: "video",
-      message: friendlyRemakeError(technicalMessage, "video"),
+      recovery,
+      message: friendlyRemakeError(technicalMessage, "video", recovery),
       technicalMessage,
       videoRetryAvailable: !savedRun?.videoTaskId && item.editedKeyframes.length > 0,
       submissionUncertain: ["submitting", "uncertain"].includes(savedRun?.videoSubmission?.status),
@@ -908,7 +1152,7 @@ async function retrySavedRemakeVideo() {
 async function retryRemakeImages(indexes = [0], continueOnly = false) {
   const item = state.remake;
   const selectedIndexes = [...new Set((Array.isArray(indexes) ? indexes : [indexes]).filter(Number.isInteger))].sort((a, b) => a - b);
-  if (!item.runId || item.running || item.stopping || !selectedIndexes.length) return;
+  if (!item.runId || !canRepairRemake(item) || !selectedIndexes.length) return;
   item.running = true;
   item.videoTaskSubmitted = false;
   item.stopConfirm = null;
@@ -925,18 +1169,29 @@ async function retryRemakeImages(indexes = [0], continueOnly = false) {
     item.editedImage = response.editedImage;
     item.editedKeyframes = response.editedKeyframes || (response.editedImage ? [response.editedImage] : []);
     item.keyframeTimes = response.keyframeTimes || item.keyframeTimes;
+    item.keyframeProblems = (item.keyframeProblems || []).filter(index => !selectedIndexes.includes(index));
     item.selectedRetryIndexes = [];
     item.imageReady = true;
     notify("替换关键帧已就绪，请确认后生成视频");
-  } catch (error) { if (isCurrentRemake(item)) item.error = { stage: "image", rawStage: "image", message: friendlyRemakeError(error, "image"), technicalMessage: cleanRemoteError(error) }; }
+  } catch (error) {
+    if (!isCurrentRemake(item)) return;
+    if (/原始关键帧不存在/.test(cleanRemoteError(error))) {
+      item.keyframeProblems = [...new Set([...(item.keyframeProblems || []), ...selectedIndexes])];
+      item.imageReady = true;
+      notify("原始画面已丢失，请为待处理的关键帧上传替代图片。");
+    } else item.error = { stage: "image", rawStage: "image", imageFailure: error.imageFailure, keyframeIndex: error.keyframeIndex, message: friendlyRemakeError(error, "image"), technicalMessage: cleanRemoteError(error) };
+  }
   finally { if (isCurrentRemake(item)) { item.stopConfirm = null; item.running = false; item.imageRetrying = false; item.progress = 0; if (state.active === "remake") render(); } }
 }
 
 function imageRetryMarkup(item, processing = false) {
   const icon = processing
     ? '<svg class="network-progress-ring" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" opacity=".18"/><path d="M12 3a9 9 0 0 1 9 9"/></svg>'
-    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9a13 13 0 0 1 16 0M7 13a8 8 0 0 1 10 0M10 17a3 3 0 0 1 4 0M4 3l16 18"/></svg>';
-  return `<header class="output-heading"><h2>生成替换关键帧</h2></header><div class="network-retry-preview" role="status"><i class="network-retry-symbol ${processing ? "is-processing" : ""}">${icon}</i><h2>${processing ? "正在继续生成" : /连接|网络|超时/.test(item.error?.technicalMessage || "") ? "网络连接不稳定" : "生成暂时中断"}</h2><p ${processing ? 'data-image-retry-progress' : ''}>${processing ? `已完成 ${item.imageCompleted || 0}/${item.imageTotal || 4} 张，正在继续处理剩余图片。` : "已完成的图片已保留，请重试。"}</p><button class="primary" data-action="retry-remake-images-direct" type="button" ${processing ? "disabled" : ""}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 10a8 8 0 1 0-1 7M20 4v6h-6"/></svg>${processing ? "正在重试…" : "重试"}</button><small>${processing ? "已完成的图片不会重新生成" : "中断的图片重新生成可能再次计费"}</small></div>`;
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v6m0 4h.01"/></svg>';
+  const failure = item.error?.imageFailure;
+  const index = Number.isInteger(failure?.index) ? failure.index : item.error?.keyframeIndex;
+  const reason = friendlyImageError(item.error?.technicalMessage || item.error?.message, failure);
+  return `<header class="output-heading"><h2>生成替换关键帧</h2></header><div class="network-retry-preview" role="status"><i class="network-retry-symbol ${processing ? "is-processing" : ""}">${icon}</i><h2>${processing ? "正在继续生成" : "关键帧生成未完成"}</h2><p ${processing ? 'data-image-retry-progress' : 'role="alert"'}>${processing ? `已完成 ${item.imageCompleted || 0}/${item.imageTotal || 4} 张，正在继续处理剩余图片。` : esc(reason)}</p>${!processing && Number.isInteger(index) ? `<p>第 ${index + 1} 张未完成，已做好的图片已保留。</p>` : ""}<button class="primary" data-action="retry-remake-images-direct" type="button" ${processing ? "disabled" : ""}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 10a8 8 0 1 0-1 7M20 4v6h-6"/></svg>${processing ? "正在重试…" : "重试"}</button><small>已完成的图片不会重新生成</small></div>`;
 }
 
 function voiceFingerprint(seed = 1) {
@@ -973,7 +1228,7 @@ function syncRemakeSubmitUi() {
   if (generateButton) generateButton.disabled = !ready || item.running || item.imageReady || !item.products.length || !item.reference || (item.videoMode !== "reference_video" && !voiceValid);
   const confirmButton = workspace.querySelector('[data-action="confirm-remake-image"]');
   if (confirmButton) {
-    confirmButton.disabled = !voiceValid;
+    confirmButton.disabled = !voiceValid || remakeKeyframeProblems(item).length > 0 || !canRepairRemake(item);
     confirmButton.textContent = `确认并生成 ${item.duration} 秒视频`;
   }
   const note = workspace.querySelector(".control-panel .submit small");
@@ -1045,7 +1300,7 @@ function renderVoiceOverlay(item) {
   if (item.voicePanel === "create") {
     const source = item.voiceSource;
     const uploadIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0-4 4m4-4 4 4M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>`;
-    return `<div class="voice-overlay" data-action="voice-close-panel"><section class="voice-dialog voice-create-dialog" role="dialog" aria-modal="true" aria-label="创建新音色"><header><span><small>声音库 / 新建</small><h2>创建新音色</h2></span><button data-action="voice-close-panel" type="button" aria-label="关闭">×</button></header><div class="voice-create-body"><p class="voice-create-hint">上传一段 <strong>8–15 秒</strong>的音频，最好只有目标人物说话，没有背景音乐或其他人的声音。</p><label class="voice-audio-upload" for="voiceSourceInput" tabindex="0"><i>${uploadIcon}</i><span><strong>${esc(source?.name || "选择参考音频")}</strong><small>${source?.checking ? "正在检查时长…" : source?.duration ? `${Number(source.duration).toFixed(1)} 秒 · 点击更换文件` : "支持 MP3、WAV、M4A"}</small></span></label><input id="voiceSourceInput" type="file" accept="audio/mpeg,audio/wav,audio/mp4,.mp3,.wav,.m4a" ${item.voiceBusy ? "disabled" : ""} hidden><label class="voice-name-field"><span>音色名称</span><input id="voiceNameInput" value="${esc(item.voiceDraftName || "")}" placeholder="例如：我的声音" maxlength="20" ${item.voiceBusy ? "disabled" : ""}></label><div class="voice-preview-note"><i>▶</i><span>固定试听台词：“你好，这里是我的声音。希望接下来的作品，能带给你不一样的惊喜。”</span></div>${item.voiceCreateError ? `<p class="voice-create-error" role="alert">${esc(item.voiceCreateError)}</p>` : ""}</div><div class="voice-create-actions"><button data-action="voice-back-picker" type="button" ${item.voiceBusy ? "disabled" : ""}>返回声音库</button><button class="primary" data-action="voice-create" type="button" ${item.voiceBusy || !source?.file || source.checking || !(source.duration >= 8 && source.duration <= 15) ? "disabled" : ""}>${item.voiceBusy ? "正在创建音色和试听…" : "创建并生成试听"}</button></div></section></div>`;
+    return `<div class="voice-overlay" data-action="voice-close-panel"><section class="voice-dialog voice-create-dialog" role="dialog" aria-modal="true" aria-label="创建新音色"><header><span><small>声音库 / 新建</small><h2>创建新音色</h2></span><button data-action="voice-close-panel" type="button" aria-label="关闭">×</button></header><div class="voice-create-body"><p class="voice-create-hint">上传一段 <strong>8–15 秒</strong>的音频，最好只有目标人物说话，没有背景音乐或其他人的声音。</p><label class="voice-audio-upload" for="voiceSourceInput" tabindex="0"><i>${uploadIcon}</i><span><strong>${esc(source?.name || "选择参考音频")}</strong><small>${source?.checking ? "正在检查时长…" : source?.duration ? `${Number(source.duration).toFixed(1)} 秒 · 点击更换文件` : "MP3 / WAV / M4A · 最大 20 MB（20,000,000 字节）"}</small></span></label><input id="voiceSourceInput" type="file" accept="audio/mpeg,audio/wav,audio/mp4,.mp3,.wav,.m4a" ${item.voiceBusy ? "disabled" : ""} hidden><label class="voice-name-field"><span>音色名称</span><input id="voiceNameInput" value="${esc(item.voiceDraftName || "")}" placeholder="例如：我的声音" maxlength="20" ${item.voiceBusy ? "disabled" : ""}></label><div class="voice-preview-note"><i>▶</i><span>固定试听台词：“你好，这里是我的声音。希望接下来的作品，能带给你不一样的惊喜。”</span></div>${item.voiceCreateError ? `<p class="voice-create-error" role="alert">${esc(item.voiceCreateError)}</p>` : ""}</div><div class="voice-create-actions"><button data-action="voice-back-picker" type="button" ${item.voiceBusy ? "disabled" : ""}>返回声音库</button><button class="primary" data-action="voice-create" type="button" ${item.voiceBusy || !source?.file || source.checking || Boolean(validateVoiceSourceFile(source.file)) || !(source.duration >= 8 && source.duration <= 15) ? "disabled" : ""}>${item.voiceBusy ? "正在创建音色和试听…" : "创建并生成试听"}</button></div></section></div>`;
   }
   return "";
 }
@@ -1062,7 +1317,7 @@ function renderRemake() {
   const voiceLimit = item.duration * 6;
   const voiceWithinLimit = item.voiceScript.length <= voiceLimit;
   const voiceEnabled = item.voiceEnabled !== false;
-  const voiceLocked = item.running;
+  const voiceLocked = item.running || Boolean(item.videoTaskSubmitted) || ["uncertain", "submitting", "accepted"].includes(item.videoSubmissionStatus);
   const soundOptions = options("audio", ["无声音", "有声音"], item.audio === "voice" ? "有声音" : "无声音");
   const selectedVoice = item.voices.find((voice) => voice.id === item.selectedVoiceId) || null;
   const voiceChoice = remakeVoiceChoiceMarkup(item, voiceLocked);
@@ -1087,18 +1342,28 @@ function renderRemake() {
     const stageLabel = { image: "生成替换关键帧", video: "生成替换视频", voice: "生成配音" }[item.error.rawStage] || item.error.stage || "完成任务";
     const safeRetry = item.runId && !videoRetryAvailable ? `<button class="primary" data-action="retry-remake" type="button">↻　继续当前任务</button>` : "";
     const paidRetry = item.runId && item.error.confirmedFailed ? `<button class="secondary" data-action="retry-remake-paid" type="button">重新尝试失败步骤</button>` : "";
-    const safetyNote = tunnelFailure ? "任务尚未提交，不会产生费用。" : item.runId ? "当前进度已经保留，可以稍后继续。" : "任务尚未开始，请稍后再试。";
-    if (videoRetryAvailable) {
+    const safetyNote = tunnelFailure ? "任务尚未提交，不会产生费用。" : item.runId ? item.error.confirmedFailed ? "请点击“重新尝试失败步骤”重试，已完成的图片会保留。" : "请点击“继续当前任务”，检查并继续原来的任务。" : "任务尚未开始，请稍后再试。";
+    const recovery = item.error.recovery;
+    if (/商品参考图|产品参考图/.test(item.error.technicalMessage || "")) {
+      output = `<header class="output-heading"><h2>请检查商品参考图</h2></header><div class="failure-state"><i>!</i><h2>素材阶段未完成</h2><p>${esc(friendlyRemakeError(item.error.technicalMessage, "video"))}</p><button class="primary" data-action="repair-product-reference" type="button">重新选择商品参考图</button></div>`;
+    } else if (recovery && item.videoTaskSubmitted && item.videoConfirmedFailed && !["uncertain", "submitting"].includes(item.videoSubmissionStatus)) {
+      output = `<header class="output-heading"><h2>产品替换</h2></header><div class="failure-state"><i>!</i><h2>请修复素材后继续</h2><p>${esc(friendlyRemakeError(item.error.technicalMessage, "video", recovery))}</p><p>原任务已确认失败。将保留原任务记录和已有关键帧，创建可修改的恢复副本。</p><button class="primary" data-action="prepare-remake-recovery" type="button">修改素材后重试</button></div>`;
+    } else if (recovery && canRepairRemake(item)) {
+      const actions = recovery.kind === "voice"
+        ? '<button class="primary" data-action="repair-remake-voice-create" type="button">重新上传声音</button><button class="secondary" data-action="repair-remake-voice-picker" type="button">选择其他音色</button>'
+        : '<button class="primary" data-action="review-saved-keyframes" type="button">查看并处理关键帧</button>';
+      output = `<header class="output-heading"><h2>产品替换</h2></header><div class="failure-state"><i>!</i><h2>${recovery.kind === "voice" ? "请更新参考声音" : "请处理关键帧"}</h2><p>${esc(friendlyRemakeError(item.error.technicalMessage, "video", recovery))}</p>${recovery.kind === "keyframes" && !recovery.indexes?.length ? "<p>服务没有指出具体图片，请查看全部关键帧。</p>" : ""}<p>已有关键帧和当前任务已保留，处理后请再次确认。</p><div class="confirm-actions">${actions}</div></div>`;
+    } else if (videoRetryAvailable) {
       const submissionUncertain = item.error.submissionUncertain === true;
       const framesIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="12" height="12" rx="2"/><path d="M8 4h10a2 2 0 0 1 2 2v10"/></svg>`;
       const retryIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 8a8 8 0 1 0 1 7"/><path d="M19 3v5h-5"/><path d="m10 9 6 3-6 3z"/></svg>`;
       const reviewIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12s3.5-6 9-6 9 6 9 6-3.5 6-9 6-9-6-9-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>`;
       const retryControls = item.videoRetryConfirm
-        ? `<div class="video-retry-confirm"><span><strong>${submissionUncertain ? "仍要重新提交视频？" : "继续完成视频？"}</strong><small>${submissionUncertain ? "上次提交可能已被受理，重新提交可能重复计费。关键帧不会重新生成。" : "将直接使用已经生成的关键帧，不会重复生成图片。开始后可能产生一次视频生成费用。"}</small></span><div><button class="secondary" data-action="cancel-remake-video-retry" type="button">取消</button><button class="primary" data-action="confirm-remake-video-retry" type="button">${submissionUncertain ? "确认重新提交" : "继续生成"}</button></div></div>`
-        : `<div class="video-recovery-actions"><button class="secondary" data-action="review-saved-keyframes" type="button"><i>${reviewIcon}</i><span><small>确认已有结果</small><strong>查看 ${item.editedKeyframes.length} 张关键帧</strong></span></button><button class="primary" data-action="prepare-remake-video-retry" type="button"><i>${retryIcon}</i><span><small>从当前进度继续</small><strong>继续生成视频</strong></span></button></div>`;
-      output = `<header class="output-heading"><h2>产品替换</h2></header><div class="failure-state failure-state--recoverable"><div class="recovery-frame-icon"><i>${framesIcon}</i><b>${item.error.preservedKeyframeCount || item.editedKeyframes.length}</b></div><small>生成暂时中断</small><h2>关键帧已保留，可以继续完成视频</h2><p>${submissionUncertain ? "上次视频提交结果暂时无法确认，请先核对任务记录；再次提交可能重复计费。" : "视频服务暂时未能响应。已经完成的关键帧不会重复生成。"}</p>${retryControls}</div>`;
+        ? `<div class="video-retry-confirm"><span><strong>${submissionUncertain ? "确定再次生成视频？" : "继续完成视频？"}</strong><small>${submissionUncertain ? "还没收到上次生成的结果。再次生成会保留已有图片。" : "会用已经做好的图片继续生成视频，图片不会重做。"}</small></span><div><button class="secondary" data-action="cancel-remake-video-retry" type="button">取消</button><button class="primary" data-action="confirm-remake-video-retry" type="button">${submissionUncertain ? "确定再次生成" : "继续生成"}</button></div></div>`
+        : `<div class="video-recovery-actions"><button class="secondary" data-action="review-saved-keyframes" type="button" ${canRepairRemake(item) ? "" : "disabled"}><i>${reviewIcon}</i><span><small>确认已有结果</small><strong>查看 ${item.editedKeyframes.length} 张关键帧</strong></span></button><button class="primary" data-action="prepare-remake-video-retry" type="button"><i>${retryIcon}</i><span><small>从当前进度继续</small><strong>继续生成视频</strong></span></button></div>`;
+      output = `<header class="output-heading"><h2>产品替换</h2></header><div class="failure-state failure-state--recoverable"><div class="recovery-frame-icon"><i>${framesIcon}</i><b>${item.error.preservedKeyframeCount || item.editedKeyframes.length}</b></div><small>生成暂时中断</small><h2>图片已保存，可以继续生成视频</h2><p>${esc(item.error.message || friendlyRemakeError(item.error.technicalMessage, "video"))}</p><p>${submissionUncertain ? "还没收到上次生成的结果，做好的图片已保存。" : "做好的图片已经保存，不会重新生成。"}</p>${retryControls}</div>`;
     } else {
-      output = `<header class="output-heading"><h2>产品替换</h2></header><div class="failure-state"><i>!</i><small>${tunnelFailure ? "连接未完成" : `${esc(stageLabel)}未完成`}</small><h2>${tunnelFailure ? "网络暂时未连接成功" : "这一步暂时没有完成"}</h2><p>${esc(item.error.message || "服务暂时未能响应，请稍后再试。")}</p><p>${safetyNote}</p><div class="confirm-actions">${safeRetry}${paidRetry}</div></div>`;
+      output = `<header class="output-heading"><h2>产品替换</h2></header><div class="failure-state"><i>!</i><small>${tunnelFailure ? "连接未完成" : `${esc(stageLabel)}未完成`}</small><h2>${tunnelFailure ? "网络暂时未连接成功" : "这一步暂时没有完成"}</h2><p>${esc(item.error.message || "这一步没能完成，暂时还查不出原因。请导出诊断日志，发给工作人员。")}</p><p>${safetyNote}</p><div class="confirm-actions">${safeRetry}${paidRetry}</div></div>`;
     }
   }
   const stopStage = remakeStopStage(item);
@@ -1108,7 +1373,8 @@ function renderRemake() {
   if (item.running && item.imageRetrying) output = imageRetryMarkup(item, true);
   if (item.imageReady && item.editedKeyframes.length) {
     const selectedRetryIndexes = item.selectedRetryIndexes || [];
-    output = `<header class="output-heading"><h2>请逐张确认商品替换是否正确</h2></header><div class="keyframe-review-grid">${item.editedKeyframes.map((frame, index) => { const selected = selectedRetryIndexes.includes(index); return `<article class="${selected ? "is-selected" : ""}"><img src="${esc(new URL(frame.url, item.serviceBaseUrl).toString())}" alt="替换关键帧 ${index + 1}"><span><strong>关键帧 ${index + 1}</strong><small>约 ${Number(item.keyframeTimes[index] || 0).toFixed(1)} 秒</small></span><button class="keyframe-select" data-action="toggle-remake-image" data-keyframe-index="${index}" type="button" aria-pressed="${selected}"><i aria-hidden="true">${selected ? "✓" : ""}</i>${selected ? "已选择" : "选择重做"}</button></article>`; }).join("")}</div><div class="confirm-actions"><button class="icon-button" data-action="retry-selected-remake-images" type="button" ${selectedRetryIndexes.length ? "" : "disabled"}>重新生成所选${selectedRetryIndexes.length ? `（${selectedRetryIndexes.length}）` : ""}</button><button class="primary" data-action="confirm-remake-image" type="button" ${voiceSettingsValid ? "" : "disabled"}>确认并生成 ${item.duration} 秒视频</button></div>`;
+    const problems = remakeKeyframeProblems(item);
+    output = `<header class="output-heading"><h2>请逐张确认商品替换是否正确</h2></header>${problems.length ? '<p role="alert">请先重新生成或上传替代图片，处理全部问题关键帧后再确认。替代图片支持 JPG / PNG / WEBP，小于 10 MB（10,000,000 字节）。</p>' : ""}<div class="keyframe-review-grid">${Array.from(item.editedKeyframes, (frame, index) => { const selected = selectedRetryIndexes.includes(index); const problem = problems.includes(index); return `<article class="${selected ? "is-selected" : ""}">${frame?.url ? `<img src="${esc(new URL(frame.url, item.serviceBaseUrl || location.href).toString())}" alt="替换关键帧 ${index + 1}">` : `<div class="empty" style="min-height:0;aspect-ratio:9/16;padding:12px" role="img" aria-label="关键帧 ${index + 1} 缺失"><i>!</i><p>关键帧图片缺失</p></div>`}<span><strong>关键帧 ${index + 1}${problem ? " · 待处理" : ""}</strong><small>约 ${Number(item.keyframeTimes[index] || 0).toFixed(1)} 秒</small></span><button class="keyframe-select" data-action="toggle-remake-image" data-keyframe-index="${index}" type="button" aria-pressed="${selected}" ${canRepairRemake(item) ? "" : "disabled"}><i aria-hidden="true">${selected ? "✓" : ""}</i>${selected ? "已选择" : "选择重做"}</button>${problem ? `<button class="icon-button" data-action="upload-remake-keyframe" data-keyframe-index="${index}" type="button" ${canRepairRemake(item) ? "" : "disabled"}>上传替代图片</button><input type="file" id="remakeKeyframeInput${index}" data-replace-keyframe="${index}" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" hidden>` : ""}</article>`; }).join("")}</div><div class="confirm-actions"><button class="icon-button" data-action="retry-selected-remake-images" type="button" ${selectedRetryIndexes.length && canRepairRemake(item) ? "" : "disabled"}>重新生成所选${selectedRetryIndexes.length ? `（${selectedRetryIndexes.length}）` : ""}</button><button class="primary" data-action="confirm-remake-image" type="button" ${voiceSettingsValid && !problems.length && canRepairRemake(item) ? "" : "disabled"}>确认并生成 ${item.duration} 秒视频</button></div>`;
   }
   if (stopStage && !(item.running && stopStage === "video")) output += `<div class="remake-stop-actions"><button class="remake-stop-trigger" data-action="remake-stop-open" type="button" ${item.stopping ? "disabled" : ""}>${stopStage === "image" ? "保留图片并结束" : "中止任务"}</button></div>`;
   if (item.result) {
@@ -1514,7 +1780,7 @@ document.addEventListener("click", async (event) => {
     try {
       const result = await videoClient.exportLibraryTask({ kind: run.kind === "remake" ? "remake" : "split", runId: run.runId, sourceId: run.sourceId, name: run.name });
       if (!result.canceled) notify(`已导出 ${result.count} 个文件到 ${result.destination}`);
-    } catch (error) { notify(`导出失败：${error.message}`); }
+    } catch (error) { notify(friendlyOperationError(error, "export")); }
     finally {
       libraryExportBusy = false;
       workspace.querySelectorAll("[data-library-export]").forEach((button) => { button.disabled = false; button.querySelector("span").textContent = "导出"; });
@@ -1576,6 +1842,21 @@ document.addEventListener("click", async (event) => {
     return;
   }
   const action = event.target.closest("[data-action]")?.dataset.action;
+  if (action === "prepare-remake-recovery") { void prepareRemakeRecovery(); return; }
+  if (action === "repair-product-reference") { document.querySelector("#productInput")?.click(); return; }
+  if (action === "repair-remake-voice-create" || action === "repair-remake-voice-picker") {
+    if (!canRepairRemake(state.remake)) return;
+    state.remake.voiceRecoveryPending = true;
+    state.remake.useSavedVoice = false;
+    state.remake.voiceSource = null;
+    state.remake.voiceCreateError = "";
+    replaceVoiceOverlay(action === "repair-remake-voice-create" ? "create" : "picker");
+    return;
+  }
+  if (action === "upload-remake-keyframe") {
+    if (canRepairRemake(state.remake)) document.querySelector(`#remakeKeyframeInput${Number(event.target.closest("[data-action]")?.dataset.keyframeIndex)}`)?.click();
+    return;
+  }
   if (action === "voice-open-picker") { state.remake.revoicePending = false; replaceVoiceOverlay("picker"); return; }
   if (action === "voice-open-create") {
     state.remake.revoicePending = false;
@@ -1605,7 +1886,7 @@ document.addEventListener("click", async (event) => {
       syncVoicePlaybackUi();
       return;
     }
-    if (!voice?.sampleUrl) { notify("这个声音没有可试听的本地样本"); return; }
+    if (!voice?.sampleUrl) { notify(friendlyOperationError("没有试听样本", "preview")); return; }
     voicePreviewAudio = new Audio(voice.sampleUrl);
     state.remake.voicePlayingId = voiceId;
     syncVoicePlaybackUi();
@@ -1619,14 +1900,16 @@ document.addEventListener("click", async (event) => {
       state.remake.voicePlayingId = null;
       voicePreviewAudio = null;
       syncVoicePlaybackUi();
-      notify(`试听失败：${error.message}`);
+      notify(friendlyOperationError(error, "preview"));
     });
     return;
   }
   if (action === "voice-select") {
+    if (!canRepairRemake(state.remake) && !state.remake.result) return;
     state.remake.selectedVoiceId = event.target.closest("[data-action]")?.dataset.voiceId || null;
     state.remake.useSavedVoice = false;
     const selectedVoice = state.remake.voices.find((voice) => voice.id === state.remake.selectedVoiceId);
+    if (completeRemakeVoiceRecovery(state.remake)) return;
     const shouldRevoice = state.remake.revoicePending;
     if (shouldRevoice) {
       state.remake.revoicePending = false;
@@ -1643,6 +1926,8 @@ document.addEventListener("click", async (event) => {
   if (action === "voice-create") {
     const source = state.remake.voiceSource;
     if (state.remake.voiceBusy || !source?.file || source.checking) return;
+    const fileError = validateVoiceSourceFile(source.file);
+    if (fileError) { state.remake.voiceCreateError = fileError; replaceVoiceOverlay("create"); return; }
     if (!(source.duration >= 8 && source.duration <= 15)) { state.remake.voiceCreateError = "参考音频时长需在 8–15 秒之间"; replaceVoiceOverlay("create"); return; }
     const name = document.querySelector("#voiceNameInput")?.value.trim() || "新音色";
     state.remake.voiceDraftName = name;
@@ -1659,6 +1944,7 @@ document.addEventListener("click", async (event) => {
       state.remake.useSavedVoice = false;
       state.remake.voiceSource = null;
       state.remake.voiceDraftName = "";
+      if (completeRemakeVoiceRecovery(state.remake)) return;
       replaceVoiceOverlay("picker");
       syncRemakeVoiceChoice();
       notify("新音色已创建，点击播放可试听效果");
@@ -1701,7 +1987,7 @@ document.addEventListener("click", async (event) => {
     } catch {
       confirmButton.disabled = false;
       confirmButton.textContent = "删除音色";
-      notify("删除失败，请稍后重试");
+      notify("音色没能删除，请稍后再点“删除音色”。");
     }
     return;
   }
@@ -1714,7 +2000,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
   if (action === "open-kling" || action === "open-shot") {
-    videoClient.openWorkspace(action === "open-kling" ? "kling" : "shot").catch((error) => notify(error.message));
+    videoClient.openWorkspace(action === "open-kling" ? "kling" : "shot").catch((error) => notify(friendlyOperationError(error, "directory")));
     return;
   }
   if (action === "toggle-remake-voice") {
@@ -1737,7 +2023,7 @@ document.addEventListener("click", async (event) => {
     const generateButton = document.querySelector('[data-action="remake-generate"]');
     if (generateButton) generateButton.disabled = state.remake.config?.configured !== true || state.remake.running || state.remake.imageReady || !state.remake.products.length || !state.remake.reference || !voiceSettingsValid;
     const confirmButton = document.querySelector('[data-action="confirm-remake-image"]');
-    if (confirmButton) confirmButton.disabled = !voiceSettingsValid;
+    if (confirmButton) confirmButton.disabled = !voiceSettingsValid || remakeKeyframeProblems(state.remake).length > 0 || !canRepairRemake(state.remake);
     const submitNote = document.querySelector(".submit small");
     if (submitNote && state.remake.products.length && state.remake.reference && state.remake.config?.configured === true) submitNote.textContent = `确认全部替换关键帧后再生成视频 · ${state.remake.duration} 秒 · 9:16 · 768P · ${enabled ? "使用已选声音生成口型与配音" : "不生成声音与口型"}`;
     return;
@@ -1747,11 +2033,7 @@ document.addEventListener("click", async (event) => {
   if (action === "remake-stop-dismiss") { dismissRemakeStop(); return; }
   if (action === "remake-stop-confirm") { void stopRemake(); return; }
   if (action === "review-saved-keyframes") {
-    state.remake.videoRetryConfirm = false;
-    state.remake.error = null;
-    state.remake.imageReady = true;
-    state.remake.stage = "替换关键帧已生成";
-    render();
+    reviewRemakeKeyframes(state.remake);
     return;
   }
   if (action === "prepare-remake-video-retry") { state.remake.videoRetryConfirm = true; render(); return; }
@@ -1762,9 +2044,10 @@ document.addEventListener("click", async (event) => {
     return;
   }
   if (action === "retry-remake-paid") {
-    if (!window.confirm("这会重新提交失败阶段并可能再次计费，是否继续？")) return;
+    if (!window.confirm("要重新尝试失败的步骤吗？已完成的图片会保留。")) return;
     if (state.remake.error?.rawStage === "image" && state.remake.runId) void retryRemakeImages([Number.isInteger(state.remake.error.keyframeIndex) ? state.remake.error.keyframeIndex : 0]);
-    else void runRemake({ retryVideo: state.remake.error?.rawStage === "video" });
+    else if (state.remake.error?.rawStage === "video") void retrySavedRemakeVideo();
+    else void runRemake();
     return;
   }
   if (action === "confirm-remake-image") { void confirmRemakeImage(); return; }
@@ -1935,7 +2218,7 @@ document.addEventListener("input", (event) => {
     const selectedVoice = state.remake.voices.find((voice) => voice.id === state.remake.selectedVoiceId);
     if (button) button.disabled = state.remake.config?.configured !== true || state.remake.running || !state.remake.products.length || !state.remake.reference || !event.target.value.trim() || !voiceWithinLimit || !selectedVoice || selectedVoice.demo === true;
     const confirmButton = document.querySelector('[data-action="confirm-remake-image"]');
-    if (confirmButton) confirmButton.disabled = state.remake.voiceEnabled && (!event.target.value.trim() || !voiceWithinLimit || !selectedVoice || selectedVoice.demo === true);
+    if (confirmButton) confirmButton.disabled = (state.remake.voiceEnabled && (!event.target.value.trim() || !voiceWithinLimit || (!state.remake.useSavedVoice && (!selectedVoice || selectedVoice.demo === true)))) || remakeKeyframeProblems(state.remake).length > 0 || !canRepairRemake(state.remake);
     return;
   }
   if (event.target.id === "audioScript") state.audio.script = event.target.value;
@@ -1948,12 +2231,15 @@ document.addEventListener("input", (event) => {
 document.addEventListener("change", async (event) => {
   const files = [...(event.target.files || [])];
   if (!files.length) return;
+  if (event.target.dataset.replaceKeyframe !== undefined) { await replaceRemakeKeyframe(Number(event.target.dataset.replaceKeyframe), files[0]); return; }
   if (event.target.id === "voiceSourceInput") {
     const source = { file: files[0], name: files[0].name, checking: true, duration: null };
     state.remake.voiceSource = source;
     state.remake.voiceCreateError = "";
     replaceVoiceOverlay("create");
     try {
+      const fileError = validateVoiceSourceFile(files[0]);
+      if (fileError) { state.remake.voiceCreateError = fileError; return; }
       const info = await videoClient.inspectReferenceAudio(files[0]);
       if (state.remake.voiceSource !== source) return;
       if (!info.hasAudio || !Number.isFinite(Number(info.duration))) throw new Error("无法读取这段音频，请选择 MP3、WAV 或 M4A 文件");
@@ -1969,7 +2255,7 @@ document.addEventListener("change", async (event) => {
     return;
   }
   if (event.target.id === "productInput" || event.target.id === "referenceInput") {
-    if (state.remake.running || state.remake.stopping) { event.target.value = ""; return; }
+    if (!canRepairRemake(state.remake)) { event.target.value = ""; return; }
     if (event.target.id === "productInput") {
       const limit = state.remake.videoMode === "reference_video" ? 1 : 3;
       if (files.length > limit) { event.target.value = ""; notify(`最多上传 ${limit} 张商品参考图，请重新选择`); return; }
@@ -1987,7 +2273,7 @@ document.addEventListener("change", async (event) => {
         state.remake.voiceDetected = { checking: false, hasAudio: info.hasAudio === true, duration: info.duration, detail: info.hasAudio ? `检测到可用音轨${info.duration ? ` · ${Number(info.duration).toFixed(1)} 秒` : ""}` : "未检测到音轨" };
       } catch (error) {
         if (state.remake.reference !== reference) return;
-        state.remake.voiceDetected = { checking: false, hasAudio: false, detail: error.message };
+        state.remake.voiceDetected = { checking: false, hasAudio: false, detail: "没能读取参考视频的声音，请重新选择一个能正常播放的 MP4 或 MOV 视频。" };
       }
       render();
       return;
@@ -2008,7 +2294,7 @@ window.addEventListener("resize", () => {
   cancelAnimationFrame(resizeFrame);
   resizeFrame = requestAnimationFrame(markOverflowingNames);
 });
-document.querySelector("#openLogs").addEventListener("click", async () => { try { await videoClient.openLogs(); } catch (error) { notify(`运行目录打开失败：${error.message}`); } });
+document.querySelector("#openLogs").addEventListener("click", async () => { try { await videoClient.openLogs(); } catch (error) { notify(friendlyOperationError(error, "directory")); } });
 document.querySelector("#exportDiagnostics")?.addEventListener("click", async (event) => {
   const button = event.currentTarget;
   if (button.disabled) return;
@@ -2054,7 +2340,7 @@ async function loadShotAssets() {
     if (state.active === "library") render();
     return true;
   } catch (error) {
-    if (state.active === "library") notify(`素材库读取失败：${error.message}`);
+    if (state.active === "library") notify(friendlyOperationError(error, "library"));
     return false;
   } finally { shotAssetsLoading = false; }
 }
@@ -2092,7 +2378,7 @@ async function loadLatestInterruptedRemake() {
     item.useSavedVoice = Boolean(run.voiceAudio);
     item.restoredVoiceName = run.voiceName || null;
     item.selectedVoiceId = run.voiceId || item.voices.find(voice => voice.name === run.voiceName)?.id || null;
-    if (run.stage === "image" && run.imageProvider === "wawapi") {
+    if (run.stage === "image" && run.imageProvider === "wawapi" && !run.recovery) {
       Object.assign(item, {
         runId: run.id, serviceBaseUrl: response.baseUrl || "", videoMode: run.videoMode,
         duration: Number(run.duration) || 5, voiceScript: run.voiceScript || "",
@@ -2100,14 +2386,15 @@ async function loadLatestInterruptedRemake() {
         editedKeyframes: run.editedKeyframes || [], imageReady: false,
         imageCompleted: (run.imageTasks || []).filter(t => t.status === "SUCCEEDED").length,
         imageTotal: run.keyframes?.length || 4,
-        error: { stage: "image", rawStage: "image", technicalMessage: run.message || "", message: "发现未完成的关键帧任务，请重试继续" }
+        error: { stage: "image", rawStage: "image", imageFailure: run.imageFailure, technicalMessage: run.message || "", message: friendlyImageError(run.message, run.imageFailure) }
       });
       if (state.active === "remake") render();
       notify("已找回关键帧任务，点击重试可继续，不会重做已完成图片");
       return;
     }
-    const editedKeyframes = Array.isArray(run.editedKeyframes) ? run.editedKeyframes.filter(Boolean) : [];
-    if (!editedKeyframes.length) return;
+    const editedKeyframes = Array.isArray(run.editedKeyframes) ? run.editedKeyframes : [];
+    if (!editedKeyframes.length && run.recovery?.kind !== "keyframes") return;
+    const recovery = applyRemakeRecovery(item, run, run.message);
     Object.assign(item, {
       runId: run.id,
       videoTaskSubmitted: Boolean(run.videoTaskId),
@@ -2124,8 +2411,8 @@ async function loadLatestInterruptedRemake() {
       videoRetryConfirm: false,
       stage: "根据确认关键帧生成视频",
       error: run.videoTaskId
-        ? { stage: "video", rawStage: "video", message: friendlyRemakeError(run.message, "video"), technicalMessage: run.message || "", confirmedFailed: String(run.status || "").toUpperCase() === "FAILED" }
-        : { stage: "video", rawStage: "video", message: friendlyRemakeError(run.message, "video"), technicalMessage: run.message || "", videoRetryAvailable: true, submissionUncertain: ["submitting", "uncertain"].includes(run.videoSubmission?.status), preservedKeyframeCount: editedKeyframes.length }
+        ? { stage: "video", rawStage: "video", recovery, message: friendlyRemakeError(run.message, "video", recovery), technicalMessage: run.message || "", confirmedFailed: String(run.status || "").toUpperCase() === "FAILED" }
+        : { stage: "video", rawStage: "video", recovery, message: friendlyRemakeError(run.message, "video", recovery), technicalMessage: run.message || "", videoRetryAvailable: true, submissionUncertain: ["submitting", "uncertain"].includes(run.videoSubmission?.status), preservedKeyframeCount: editedKeyframes.length }
     });
     if (state.active === "remake") render();
     notify(`已找回 ${editedKeyframes.length} 张替换关键帧，无需重新生成`);
@@ -2163,7 +2450,10 @@ async function loadKlingAssets() {
     sortLibraryNewestFirst();
     if (state.active === "library") render();
     return true;
-  } catch { return false; } finally { klingAssetsLoading = false; }
+  } catch (error) {
+    if (state.active === "library") notify(friendlyOperationError(error, "library"));
+    return false;
+  } finally { klingAssetsLoading = false; }
 }
 function replaceKlingLibraryAssets(response) {
   const assets = (response.assets || []).map(asset => ({ name: asset.name, url: new URL(asset.relativeUrl, response.baseUrl).toString(), kind: asset.kind === "image" ? "image" : "video", origin: "产品替换", remoteKey: `${asset.runId}:${asset.relativeUrl}`, runId: asset.runId, sourceId: asset.sourceId, sourceFolderName: asset.sourceFolderName, sourceFilename: asset.sourceFilename, workflow: "remake", voiceName: asset.voiceName, completedAt: asset.completedAt }));

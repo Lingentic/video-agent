@@ -7,6 +7,7 @@ import { calculateCostYuan } from "./pricing.mjs";
 import { cleanupAnalysisInput, cleanupRunInputs } from "./input-cleanup.mjs";
 import { randomUUID } from "node:crypto";
 import { validateWuhenOptions } from "./wuhen-service.mjs";
+import { finalizeNamedSegments } from "./named-output-storage.mjs";
 
 const json = (value) => `${JSON.stringify(value, null, 2)}\n`;
 const sleep = (ms, signal) => new Promise((resolve, reject) => {
@@ -136,7 +137,7 @@ export async function processBatchItem({ batchDir, runDir, stateFile, item, gemi
       if (!naming) throw new Error("xinhankr 重试结束但未获得命名结果");
       const activeDurationMs = previousActiveMs + Date.now() - invocationStartedAt - invocationQuotaWaitMs;
       const quotaWaitDurationMs = previousQuotaWaitMs + invocationQuotaWaitMs;
-      const completed = await update({
+      let completed = await update({
         status: "completed", stage: "completed", completedAt: nowIso(), namedShotCount: naming.manifest.length,
         activeDurationMs, totalDurationMs: activeDurationMs, quotaWaitDurationMs,
         namingDurationMs: Math.max(0, activeDurationMs - Number(item.ffmpegDurationMs || 0)), usage: naming.usage,
@@ -144,7 +145,9 @@ export async function processBatchItem({ batchDir, runDir, stateFile, item, gemi
         providerSuccessRepeat: naming.requestAttempts?.find((entry) => entry.accepted)?.repeat || null, unknownCostAttempts: Number(naming.requestAttempts?.filter((entry) => entry.costStatus === "unknown").length || 0),
         attempts: finishAttempt("completed", { usage: naming.usage }), error: null, failedStage: null,
       });
-      await cleanupRunInputs(itemDir, completed.input, { preserveInput: completed.removeSubtitles });
+      const finalized = await finalizeNamedSegments(itemDir, completed, next => update(next));
+      completed = finalized.run;
+      if (finalized.ready) await cleanupRunInputs(itemDir, completed.input, { preserveInput: completed.removeSubtitles });
       return completed;
     }
 

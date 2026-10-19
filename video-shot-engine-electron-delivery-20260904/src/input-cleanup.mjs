@@ -1,6 +1,7 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { SHOT_DETECTION_VERSION } from "./shot-service.mjs";
+import { finalizeNamedSegments, writeNamedJson } from "./named-output-storage.mjs";
 
 export const FAILED_INPUT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -51,12 +52,20 @@ export async function cleanupStaleInputs(runsDir, now = Date.now()) {
     if (!entry.isDirectory()) continue;
     const dir = path.join(runsDir, entry.name);
     if (/^run_[a-zA-Z0-9_]+$/.test(entry.name)) {
-      const run = await readJson(dir, "artifacts", "run.json") || await readJson(dir, "run.json");
+      const currentFile = path.join(dir, "artifacts", "run.json");
+      let run = await readJson(currentFile);
+      const stateFile = run ? currentFile : path.join(dir, "run.json");
+      run ||= await readJson(stateFile);
       if (!run) {
         if (await directoryTimestamp(dir) < cutoff) await cleanupOrphanInputs(dir);
         continue;
       }
       if (run.shotDetectionVersion !== SHOT_DETECTION_VERSION) continue;
+      if (run.status === "completed" && (run.autoName || run.namedShotCount || run.workflow === "ffmpeg_gemini_naming")) {
+        const finalized = await finalizeNamedSegments(dir, run, async next => { await writeNamedJson(stateFile, next); return next; });
+        if (!finalized.ready) { await cleanupAnalysisInput(dir); continue; }
+        run = finalized.run;
+      }
       if (run.status === "completed" || (["failed", "processing", "queued"].includes(run.status) && timestampOf(run) < cutoff)) {
         await cleanupRunInputs(dir, run.input, { preserveInput: run.removeSubtitles });
       }
@@ -69,9 +78,15 @@ export async function cleanupStaleInputs(runsDir, now = Date.now()) {
     for (const itemEntry of items) {
       if (!itemEntry.isDirectory() || !/^video_[a-zA-Z0-9_]+$/.test(itemEntry.name)) continue;
       const itemDir = path.join(itemsDir, itemEntry.name);
-      const item = await readJson(itemDir, "item.json");
+      const stateFile = path.join(itemDir, "item.json");
+      let item = await readJson(stateFile);
       if (!item) continue;
       if (item.shotDetectionVersion !== SHOT_DETECTION_VERSION) continue;
+      if (item.status === "completed" && (item.autoName || item.namedShotCount || item.workflow === "ffmpeg_gemini_naming")) {
+        const finalized = await finalizeNamedSegments(itemDir, item, async next => { await writeNamedJson(stateFile, next); return next; });
+        if (!finalized.ready) { await cleanupAnalysisInput(itemDir); continue; }
+        item = finalized.run;
+      }
       if (item.status === "completed" || (["failed", "processing", "queued"].includes(item.status) && timestampOf(item) < cutoff)) {
         await cleanupRunInputs(itemDir, item.input, { preserveInput: item.removeSubtitles });
       }

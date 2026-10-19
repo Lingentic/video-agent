@@ -15,6 +15,7 @@ import { publicDir } from "./runtime-paths.mjs";
 import { cleanupAnalysisInput, cleanupRunInputs, cleanupStaleInputs } from "./input-cleanup.mjs";
 import { createWuhenService, validateWuhenOptions } from "./wuhen-service.mjs";
 import { createWuhenTransport } from "./wuhen-transport.mjs";
+import { finalizeNamedSegments, readNamedManifest } from "./named-output-storage.mjs";
 
 export async function createShotServer(overrides = {}) {
 const startupStartedAt = Date.now();
@@ -133,6 +134,7 @@ async function executeNaming(runId) {
   const namingStartedAt = Date.now();
   let run;
   let succeeded = false;
+  let namedOutputsReady = false;
   let previousNamingMs = 0;
   try {
     run = await updateRun(runId, { status: "processing", stage: "naming_prepare", namingError: null });
@@ -146,7 +148,7 @@ async function executeNaming(runId) {
         return run;
       },
     });
-    await updateRun(runId, {
+    run = await updateRun(runId, {
       status: "completed",
       stage: "completed",
       geminiFileName: result.geminiFileName,
@@ -161,6 +163,9 @@ async function executeNaming(runId) {
       providerSuccessRepeat: result.requestAttempts?.find((entry) => entry.accepted)?.repeat || null,
       unknownCostAttempts: Number(result.requestAttempts?.filter((entry) => entry.costStatus === "unknown").length || 0),
     });
+    const finalized = await finalizeNamedSegments(runDir, run, saveRun);
+    run = finalized.run;
+    namedOutputsReady = finalized.ready;
     succeeded = true;
   } catch (error) {
     const serialized = serializeError(error);
@@ -168,7 +173,7 @@ async function executeNaming(runId) {
     await fsp.writeFile(path.join(runDir, "artifacts", "naming_error.json"), `${JSON.stringify(serialized, null, 2)}\n`, "utf8");
     await updateRun(runId, { status: "failed", stage: "naming_failed", namingError: serialized.message, namingDurationMs: previousNamingMs + Date.now() - namingStartedAt, usage: error.usage || run?.usage || null, providerAttempts: error.requestAttempts || run?.providerAttempts || [], unknownCostAttempts: Number(error.requestAttempts?.filter((entry) => entry.costStatus === "unknown").length || error.unknownCostAttempts || 0) });
   } finally {
-    if (succeeded) await cleanupRunInputs(runDir, run?.input, { preserveInput: run?.removeSubtitles });
+    if (succeeded && namedOutputsReady) await cleanupRunInputs(runDir, run?.input, { preserveInput: run?.removeSubtitles });
     else await cleanupAnalysisInput(runDir);
     activeNamingRuns.delete(runId);
   }
@@ -424,6 +429,10 @@ async function startNaming(req, res, resumed = false) {
   try {
     const run = await loadRun(req.params.runId);
     assertCurrentShotDetection(run);
+    if (run.status === "completed" && !activeNamingRuns.has(run.runId) && !runExecutions.has(run.runId) && await readNamedManifest(runRoot(run.runId), run)) {
+      await finalizeNamedSegments(runRoot(run.runId), run, saveRun);
+      return res.json({ runId: run.runId, status: "completed", active: false, resumed });
+    }
     if (!gemini) throw new Error("请先在 .env 中配置 XINHANKR_API_KEY 并重启服务");
     if (run.removeSubtitles) {
       requireSubtitleKey(true);

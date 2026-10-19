@@ -72,7 +72,7 @@ for (const productCount of [1, 3]) test(`WawAPI edit (${productCount} product re
     client=spawn(process.execPath,[serverPath],{cwd:root,env:{...process.env,PORT:String(port),HOST:"127.0.0.1",RUNS_DIR:dir,MOCK_PIPELINE:"false",WAW_API_KEY:"test-only",WAW_API_BASE:"http://127.0.0.1:"+provider.address().port+"/v1"},stdio:"ignore",windowsHide:true});
     const base="http://127.0.0.1:"+port;
     for(let i=0;i<100;i++){try{if((await fetch(base+"/api/health")).ok)break;}catch{} await pause(50);}
-    const retry=(indexes=[0,1,2,3])=>fetch(base+"/api/runs/test-run/image/retry",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({indexes})});
+    const retry=(indexes=[0,1,2,3],continueOnly=false)=>fetch(base+"/api/runs/test-run/image/retry",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({indexes,continueOnly})});
     const poll=async()=>{for(let i=0;i<150;i++){const r=await(await fetch(base+"/api/runs/test-run")).json();if(["FAILED","SUCCEEDED"].includes(r.status))return r;await pause(100);}throw Error("timed out");};
     assert.equal((await retry()).status,202);
     const failed=await poll(); assert.equal(failed.status,"FAILED"); assert.equal(calls,2);
@@ -80,10 +80,12 @@ for (const productCount of [1, 3]) test(`WawAPI edit (${productCount} product re
     assert.equal(failed.productImage.id, products[0].id);
     assert.equal(failed.productImages.some(item => "path" in item), false);
     assert.equal(failed.imageTasks[0].status,"SUCCEEDED"); assert.equal(failed.imageTasks[1].status,"UNCERTAIN");
+    assert.deepEqual(failed.imageFailure, {index:1,reason:"network"});
     const savedId=failed.editedKeyframes[0].id;
     await fetch(base+"/api/runs/test-run"); assert.equal(calls,2);
     failAt=0;
-    assert.equal((await retry()).status,202);
+    // Match the failure-page IPC: one index plus continueOnly resumes all unfinished frames.
+    assert.equal((await retry([1],true)).status,202);
     const result=await poll(); assert.equal(result.status,"SUCCEEDED"); assert.equal(calls,5);
     assert.equal(result.editedKeyframes[0].id,savedId); assert.equal(result.editedKeyframes.length,4);
     assert.equal((await retry([2])).status,202);
@@ -95,6 +97,7 @@ for (const productCount of [1, 3]) test(`WawAPI edit (${productCount} product re
     gatewayAt=7;
     await retry([1]); const gateway=await poll();
     assert.equal(gateway.imageTasks[1].status,"UNCERTAIN");
+    assert.deepEqual(gateway.imageFailure, {index:1,reason:"network"});
     const beforeRestart=JSON.parse(await readFile(path.join(runDir,"run.json"),"utf8"));
     assert.equal(beforeRestart.imageTasks[1].providerError.message,"upstream timeout");
     const childArgs=client.spawnargs.slice(1);
@@ -106,6 +109,7 @@ for (const productCount of [1, 3]) test(`WawAPI edit (${productCount} product re
     await resumeOnly(); const recovered=await poll(); assert.equal(recovered.status,"SUCCEEDED"); assert.equal(calls,8);
     assert.equal(recovered.editedKeyframes[0].id,savedId);
     badAt=9; await retry([2]); const bad=await poll(); assert.equal(bad.status,"FAILED");
+    assert.deepEqual(bad.imageFailure, {index:2,reason:"invalid_result"});
     await resumeOnly(); assert.equal((await poll()).status,"SUCCEEDED"); assert.equal(calls,10);
     await new Promise(resolve=>{client.once("exit",resolve);client.kill();});
     const archived=JSON.parse(await readFile(path.join(runDir,"run.json"),"utf8"));

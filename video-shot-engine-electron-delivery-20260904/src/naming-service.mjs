@@ -6,6 +6,7 @@ import { createNamingProfile } from "./naming-profile.mjs";
 import { createNamedFilename, createUniqueFilename } from "./filename-service.mjs";
 import { calculateCostYuan } from "./pricing.mjs";
 import { ffmpegPath } from "./runtime-paths.mjs";
+import { readNamedManifest, writeNamedJson } from "./named-output-storage.mjs";
 const execFileAsync = promisify(execFile);
 const SHOT_END_TOLERANCE_SEC = 2;
 
@@ -69,6 +70,16 @@ export async function executeShotNaming({ runDir, initialRun, gemini, onStage, s
   let run = initialRun; const artifactsDir = path.join(runDir, "artifacts"); await fsp.mkdir(artifactsDir, { recursive: true }); const stage = async (name, patch = {}) => { signal?.throwIfAborted(); run = await onStage(name, patch); signal?.throwIfAborted(); return run; };
   const inputPath = run.processingInput || run.input;
   signal?.throwIfAborted();
+  const existingManifest = await readNamedManifest(runDir, run);
+  signal?.throwIfAborted();
+  if (existingManifest) {
+    const requestAttempts = await readOptionalJson(path.join(artifactsDir, "provider_attempts.json")) || run.providerAttempts || [];
+    return {
+      labels: existingManifest, manifest: existingManifest, geminiFileName: run.geminiFileName, geminiFileUri: run.geminiFileUri,
+      usage: await readOptionalJson(path.join(artifactsDir, "usage.json")) || run.usage || null,
+      requestAttempts, unknownCostAttempts: requestAttempts.filter(entry => entry.costStatus === "unknown").length,
+    };
+  }
   const profile = createNamingProfile(run.shots, run.durationSec, run.fps || 30); await fsp.writeFile(path.join(artifactsDir, "naming_prompt_snapshot.txt"), profile.prompt, "utf8"); await writeJson(path.join(artifactsDir, "naming_schema_snapshot.json"), profile.schema); await writeJson(path.join(artifactsDir, "shot_manifest_for_gemini.json"), profile.manifest);
   let raw; let result;
   try {
@@ -136,5 +147,5 @@ export async function executeShotNaming({ runDir, initialRun, gemini, onStage, s
     manifest.push({ ...label, startFrame, endFrame, frameCount, startSec, endSec: endFrame / fps, durationSec, namedPath: `named_segments/${filename}`, namedFilename: filename });
   }
   const requestAttempts = result?.requestAttempts || [];
-  await writeJson(path.join(artifactsDir, "rename_manifest.json"), manifest); return { labels, manifest, geminiFileName: run.geminiFileName, geminiFileUri: run.geminiFileUri, usage: result?.usage || run.usage || null, requestAttempts, unknownCostAttempts: requestAttempts.filter((entry) => entry.costStatus === "unknown").length };
+  await writeNamedJson(path.join(artifactsDir, "rename_manifest.json"), manifest); return { labels, manifest, geminiFileName: run.geminiFileName, geminiFileUri: run.geminiFileUri, usage: result?.usage || run.usage || null, requestAttempts, unknownCostAttempts: requestAttempts.filter((entry) => entry.costStatus === "unknown").length };
 }

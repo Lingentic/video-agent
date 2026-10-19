@@ -27,6 +27,8 @@ contextBridge.exposeInMainWorld("videoClient", {
   resumeKlingRun: (runId) => ipcRenderer.invoke("kling-resume-run", runId),
   stopKlingRun: (runId, stage) => ipcRenderer.invoke("kling-stop-run", runId, stage),
   retryKlingImage: (runId, indexes, continueOnly = false) => ipcRenderer.invoke("kling-retry-image", runId, indexes, continueOnly),
+  replaceKlingKeyframe: (runId, index, file) => ipcRenderer.invoke("kling-replace-keyframe", runId, index, webUtils.getPathForFile(file)),
+  prepareKlingRecovery: (runId) => ipcRenderer.invoke("kling-prepare-recovery", runId),
   listVoices: () => ipcRenderer.invoke("voice-list"),
   createVoice: (sourceFile, name) => ipcRenderer.invoke("voice-create", { sourcePath: webUtils.getPathForFile(sourceFile), name }),
   deleteVoice: (voiceId) => ipcRenderer.invoke("voice-delete", voiceId),

@@ -113,7 +113,7 @@ async function diagnosticJsonRequest(module, endpoint, url, options, fallbackErr
         error: item.error, namingError: item.namingError, errorRecord: item.errorRecord ? diagnosticError(item.errorRecord) : undefined }));
     if (response.ok && (String(run.status).toLowerCase() === "failed" || run.error || run.namingError || failedItems.length)) {
       void diagnostics.record("task.failed", { module, endpoint, runId: run.id || run.runId || run.batchId || body?.runId || body?.batchId,
-        stage: run.stage, status: run.status, failedAt: run.updatedAt || run.finishedAt, error: run.error || run.message, namingError: run.namingError, cloudTaskId: run.videoTaskId, failedItems }, "error");
+        stage: run.stage, status: run.status, failedAt: run.updatedAt || run.finishedAt, error: run.errorRecord || run.error || run.message, namingError: run.namingError, cloudTaskId: run.videoTaskId, failedItems }, "error");
     }
     if (!response.ok) throw new Error(body.error || body.message || body.code || `${fallbackError}：HTTP ${response.status}`);
     return body;
@@ -504,6 +504,11 @@ async function createKlingRun({ videoPath, productPaths, productPath, voiceScrip
   const selectedProductPaths = Array.isArray(productPaths) ? productPaths : productPath ? [productPath] : [];
   if (!videoPath || !selectedProductPaths.length || selectedProductPaths.some(filePath => typeof filePath !== "string" || !filePath.trim())) throw new Error("请先选择产品图和参考视频");
   if (selectedProductPaths.length > 3) throw new Error("最多上传 3 张商品参考图");
+  for (const [index, filePath] of selectedProductPaths.entries()) {
+    try {
+      await execFileAsync(runtimeFfmpegPath, ["-nostdin", "-v", "error", "-xerror", "-i", filePath, "-frames:v", "1", "-f", "null", "-"], { windowsHide: true, maxBuffer: 1024 * 1024, timeout: 30_000 });
+    } catch { throw new Error(`第 ${index + 1} 张商品参考图无法打开，请重新选择 JPG、PNG 或 WEBP 图片（小于10MB）。`); }
+  }
   const selectedVideoMode = videoMode === "reference_video" ? "reference_video" : "multi_keyframes";
   if (selectedVideoMode === "reference_video" && selectedProductPaths.length !== 1) throw new Error("当前参考原视频模式仅支持 1 张商品图");
   const selectedProductSubject = String(productSubject || "").trim();
@@ -594,6 +599,13 @@ async function stopKlingRun(runId, stage) {
 async function retryKlingImage(runId, indexes, continueOnly = false) {
   const publicBaseUrl = null; // Each retry prepares a fresh URL only when the backup is actually needed.
   return klingRequest(`api/runs/${encodeURIComponent(runId)}/image/retry`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ indexes: Array.isArray(indexes) ? indexes : [], continueOnly, publicBaseUrl }) });
+}
+
+async function replaceKlingKeyframe(runId, index, filePath) {
+  if (!runId || !Number.isInteger(index) || index < 0 || typeof filePath !== "string" || !filePath) throw new Error("请先选择需要替换的关键帧图片");
+  if ((await stat(filePath)).size >= 10_000_000) throw new Error("替代关键帧必须小于10MB，请重新选择图片。");
+  const input = await uploadKlingMedia(runId, filePath, "image", "kling-output", undefined, false);
+  return klingRequest(`api/runs/${encodeURIComponent(runId)}/keyframes/${index}/replace`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mediaId: input.id }) });
 }
 
 const imageTransportWorkers = new Set();
@@ -742,7 +754,11 @@ async function listVoices() {
 }
 
 async function resolveVoice(voiceId) {
-  const voice = (await readVoiceRegistry()).find((entry) => entry.id === voiceId);
+  let voice = (await readVoiceRegistry()).find((entry) => entry.id === voiceId);
+  if (voice?.builtin && (!voice.samplePath || !existsSync(voice.samplePath))) {
+    await ensureBuiltinVoices();
+    voice = (await readVoiceRegistry()).find((entry) => entry.id === voiceId);
+  }
   if (!voice) throw new Error("所选声音不存在，请重新选择或创建声音");
   if (voice.demo === true) throw new Error("演示音色仅用于查看选择和删除逻辑，不能提交真实生成");
   return voice;
@@ -761,6 +777,7 @@ async function dashscopeRequest(pathname, payload) {
 
 async function createVoice({ sourcePath, name }) {
   if (!sourcePath) throw new Error("请先上传一段参考音频");
+  if ((await stat(sourcePath)).size > 20_000_000) throw new Error("声音文件不能超过20MB，请上传8–15秒的MP3、WAV或M4A音频。");
   const duration = await videoDurationSeconds(sourcePath);
   if (duration < 8 || duration > 15) throw new Error("参考音频时长需在 8–15 秒之间");
   await mkdir(voiceDataRoot, { recursive: true });
@@ -1378,6 +1395,8 @@ handleClientIpc("kling-inspect-reference-audio", (_event, videoPath) => inspectR
 handleClientIpc("kling-resume-run", (_event, runId) => resumeKlingRun(runId));
 handleClientIpc("kling-stop-run", (_event, runId, stage) => stopKlingRun(runId, stage));
 handleClientIpc("kling-retry-image", (_event, runId, indexes, continueOnly) => retryKlingImage(runId, indexes, continueOnly));
+handleClientIpc("kling-replace-keyframe", (_event, runId, index, filePath) => replaceKlingKeyframe(runId, index, filePath));
+handleClientIpc("kling-prepare-recovery", (_event, runId) => klingRequest(`api/runs/${encodeURIComponent(runId)}/recovery-copy`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }));
 handleClientIpc("voice-list", () => listVoices());
 handleClientIpc("voice-create", (_event, payload) => createVoice(payload || {}));
 handleClientIpc("voice-delete", (_event, voiceId) => deleteVoice(voiceId));
